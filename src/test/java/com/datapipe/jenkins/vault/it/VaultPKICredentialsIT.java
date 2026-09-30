@@ -97,6 +97,7 @@ public class VaultPKICredentialsIT {
             when(cred.getCertificatePem()).thenReturn(fakeCertPem);
             when(cred.getPrivateKeyPem()).thenReturn(fakeKeyPem);
             when(cred.getIssuingCaPem()).thenReturn(fakeCaPem);
+            when(cred.getCaChainPem()).thenReturn(fakeCaPem);
             when(cred.getKeyStore()).thenReturn(ks);
             when(cred.getPassword()).thenReturn(Secret.fromString(KS_PASSWORD));
 
@@ -110,10 +111,10 @@ public class VaultPKICredentialsIT {
                 + "    certPemVariable: 'CERT_FILE',"
                 + "    privateKeyPemVariable: 'KEY_FILE',"
                 + "    caPemVariable: 'CA_FILE')]) {\n"
-                + "    " + getShellString() + " 'test -f " + getVariable("CERT_FILE") + "'\n"
-                + "    " + getShellString() + " 'test -f " + getVariable("KEY_FILE") + "'\n"
-                + "    " + getShellString() + " 'test -f " + getVariable("CA_FILE") + "'\n"
-                + "    " + getShellString() + " 'cat " + getVariable("CERT_FILE") + " > cert_out.txt'\n"
+                + "    " + getShellString() + " 'test -f \"" + getVariable("CERT_FILE") + "\"'\n"
+                + "    " + getShellString() + " 'test -f \"" + getVariable("KEY_FILE") + "\"'\n"
+                + "    " + getShellString() + " 'test -f \"" + getVariable("CA_FILE") + "\"'\n"
+                + "    " + getShellString() + " 'cat \"" + getVariable("CERT_FILE") + "\" > cert_out.txt'\n"
                 + "  }\n"
                 + "}", true));
 
@@ -144,6 +145,7 @@ public class VaultPKICredentialsIT {
             when(cred.getCertificatePem()).thenReturn(fakeCertPem);
             when(cred.getPrivateKeyPem()).thenReturn("-----BEGIN PRIVATE KEY-----\nZg==\n-----END PRIVATE KEY-----");
             when(cred.getIssuingCaPem()).thenReturn("-----BEGIN CERTIFICATE-----\nZg==\n-----END CERTIFICATE-----");
+            when(cred.getCaChainPem()).thenReturn("-----BEGIN CERTIFICATE-----\nZg==\n-----END CERTIFICATE-----");
             when(cred.getKeyStore()).thenReturn(ks);
             when(cred.getPassword()).thenReturn(Secret.fromString(KS_PASSWORD));
 
@@ -155,9 +157,9 @@ public class VaultPKICredentialsIT {
             job.setDefinition(new CpsFlowDefinition(""
                 + "node {\n"
                 + "  withCredentials([vaultPKI(credentialsId: '" + credentialsId + "')]) {\n"
-                + "    " + getShellString() + " 'test -f " + getVariable("VAULT_PKI_CERT") + "'\n"
-                + "    " + getShellString() + " 'test -f " + getVariable("VAULT_PKI_KEY") + "'\n"
-                + "    " + getShellString() + " 'test -f " + getVariable("VAULT_PKI_CA") + "'\n"
+                + "    " + getShellString() + " 'test -f \"" + getVariable("VAULT_PKI_CERT") + "\"'\n"
+                + "    " + getShellString() + " 'test -f \"" + getVariable("VAULT_PKI_KEY") + "\"'\n"
+                + "    " + getShellString() + " 'test -f \"" + getVariable("VAULT_PKI_CA") + "\"'\n"
                 + "  }\n"
                 + "}", true));
 

@@ -46,6 +46,20 @@ public interface VaultPKICredentials extends StandardCertificateCredentials {
      */
     String getIssuingCaPem();
 
+    /**
+     * Full CA chain PEM returned by the Vault PKI engine ({@code ca_chain} field).
+     *
+     * <p>When Vault is configured as an <em>intermediate</em> CA the chain contains the
+     * intermediate certificate followed by all parent CAs up to (and including) the root.
+     * When Vault is a root CA the value equals {@link #getIssuingCaPem()}.</p>
+     *
+     * <p>Use this value as the trust anchor for {@code openssl verify -CAfile} or mTLS clients
+     * so the full chain can be verified without installing the root CA separately.</p>
+     *
+     * @return concatenated PEM string with one or more {@code -----BEGIN CERTIFICATE-----} blocks
+     */
+    String getCaChainPem();
+
     class NameProvider extends CredentialsNameProvider<VaultPKICredentials> {
         @NonNull
         @Override

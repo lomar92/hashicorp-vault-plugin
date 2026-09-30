@@ -11,6 +11,9 @@ import hudson.model.Item;
 import hudson.model.ItemGroup;
 import hudson.util.FormValidation;
 import hudson.util.Secret;
+import io.github.jopenlibs.vault.json.JsonArray;
+import io.github.jopenlibs.vault.json.JsonObject;
+import io.github.jopenlibs.vault.json.JsonValue;
 import io.github.jopenlibs.vault.response.LogicalResponse;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -26,8 +29,11 @@ import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.logging.Level;
@@ -233,6 +239,12 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
         return getOrIssue().issuingCaPem;
     }
 
+    @Override
+    @NonNull
+    public String getCaChainPem() {
+        return getOrIssue().caChainPem;
+    }
+
     // ---- StandardCertificateCredentials implementation --------------------------
 
     @NonNull
@@ -243,7 +255,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
             return buildKeyStore(
                 issued.certificatePem,
                 issued.privateKeyPem,
-                issued.issuingCaPem,
+                issued.caChainPem,
                 issued.keystorePassword.toCharArray());
         } catch (Exception e) {
             LogRecord lr = new LogRecord(Level.WARNING,
@@ -321,6 +333,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
         String certPem = requireData(data, "certificate", issuePath);
         String keyPem = requireData(data, "private_key", issuePath);
         String caPem = requireData(data, "issuing_ca", issuePath);
+        String caChainPem = extractCaChain(response, caPem);
         String leaseId = response.getLeaseId();
 
         LOGGER.info(String.format(
@@ -328,7 +341,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
             issuePath, leaseId));
 
         Instant renewAfter = parseCertExpiry(certPem).minusSeconds(60);
-        return new IssuedCertificate(certPem, keyPem, caPem, leaseId,
+        return new IssuedCertificate(certPem, keyPem, caPem, caChainPem, leaseId,
             UUID.randomUUID().toString(), renewAfter);
     }
 
@@ -345,6 +358,46 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
         } catch (Exception e) {
             LOGGER.warning("Could not parse certificate expiry, defaulting to 30 minutes: " + e.getMessage());
             return Instant.now().plusSeconds(1800);
+        }
+    }
+
+    /**
+     * Extracts the full CA chain from the Vault PKI response's {@code ca_chain} JSON array.
+     *
+     * <p>When Vault is an intermediate CA the array contains the intermediate certificate followed
+     * by all parent CAs up to the root.  Each entry is a PEM string; they are concatenated with
+     * a newline so the result can be used directly as a {@code -CAfile} bundle.</p>
+     *
+     * <p>Falls back to {@code issuingCaPem} if {@code ca_chain} is absent or empty (root CA
+     * setup or older Vault versions).</p>
+     */
+    private static String extractCaChain(LogicalResponse response, String issuingCaPem) {
+        try {
+            JsonObject dataObject = response.getDataObject();
+            if (dataObject == null) {
+                return issuingCaPem;
+            }
+            JsonValue caChainValue = dataObject.get("ca_chain");
+            if (caChainValue == null || caChainValue.isNull()) {
+                return issuingCaPem;
+            }
+            JsonArray caChainArray = caChainValue.asArray();
+            if (caChainArray == null || caChainArray.values().isEmpty()) {
+                return issuingCaPem;
+            }
+            StringBuilder sb = new StringBuilder();
+            for (JsonValue v : caChainArray.values()) {
+                String pem = v.asString();
+                if (isNotBlank(pem)) {
+                    sb.append(pem.trim()).append('\n');
+                }
+            }
+            String chain = sb.toString().trim();
+            return isNotBlank(chain) ? chain : issuingCaPem;
+        } catch (Exception e) {
+            LOGGER.warning("Could not read ca_chain from Vault response, falling back to issuing_ca: "
+                + e.getMessage());
+            return issuingCaPem;
         }
     }
 
@@ -367,7 +420,16 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
      * which Vault PKI produces by default.  RSA PKCS#1 format
      * ({@code -----BEGIN RSA PRIVATE KEY-----}) is supported as a fallback.</p>
      */
-    static KeyStore buildKeyStore(String certPem, String privateKeyPem, String issuingCaPem,
+    /**
+     * Builds a PKCS12 {@link KeyStore} from PEM-encoded certificate data returned by the Vault
+     * PKI engine.
+     *
+     * <p>{@code caChainPem} may contain a single certificate (root CA setup) or multiple
+     * concatenated PEM blocks (intermediate CA setup: intermediate + root).  All CA certificates
+     * are included in the PKCS12 certificate chain so TLS clients can verify the full path to the
+     * root without needing to install the root CA separately.</p>
+     */
+    static KeyStore buildKeyStore(String certPem, String privateKeyPem, String caChainPem,
         char[] password)
         throws KeyStoreException, CertificateException, NoSuchAlgorithmException, IOException {
 
@@ -375,15 +437,20 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
 
         X509Certificate cert = (X509Certificate) cf.generateCertificate(
             new ByteArrayInputStream(certPem.getBytes(StandardCharsets.UTF_8)));
-        X509Certificate issuerCert = (X509Certificate) cf.generateCertificate(
-            new ByteArrayInputStream(issuingCaPem.getBytes(StandardCharsets.UTF_8)));
+
+        // Parse all CA certificates from the chain PEM (handles both single and multi-cert bundles)
+        Collection<? extends Certificate> chainCerts = cf.generateCertificates(
+            new ByteArrayInputStream(caChainPem.getBytes(StandardCharsets.UTF_8)));
+
+        List<Certificate> certChain = new ArrayList<>();
+        certChain.add(cert);
+        certChain.addAll(chainCerts);
 
         PrivateKey privateKey = parsePrivateKey(privateKeyPem);
 
         KeyStore ks = KeyStore.getInstance("PKCS12");
         ks.load(null, password);
-        ks.setKeyEntry("vault-pki", privateKey, password,
-            new Certificate[]{cert, issuerCert});
+        ks.setKeyEntry("vault-pki", privateKey, password, certChain.toArray(new Certificate[0]));
         return ks;
     }
 
@@ -518,7 +585,13 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
     static final class IssuedCertificate {
         final String certificatePem;
         final String privateKeyPem;
+        /** The direct issuer certificate ({@code issuing_ca} field from Vault). */
         final String issuingCaPem;
+        /**
+         * Full CA chain ({@code ca_chain} field from Vault), or {@code issuingCaPem} when Vault
+         * is a root CA.  May contain multiple concatenated PEM blocks (intermediate + root).
+         */
+        final String caChainPem;
         /** Vault lease ID – can be used for early revocation. */
         final String leaseId;
         /** Internal PKCS12 keystore password (not exposed to users). */
@@ -530,10 +603,11 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
         final Instant renewAfter;
 
         IssuedCertificate(String certificatePem, String privateKeyPem, String issuingCaPem,
-            String leaseId, String keystorePassword, Instant renewAfter) {
+            String caChainPem, String leaseId, String keystorePassword, Instant renewAfter) {
             this.certificatePem = certificatePem;
             this.privateKeyPem = privateKeyPem;
             this.issuingCaPem = issuingCaPem;
+            this.caChainPem = caChainPem;
             this.leaseId = leaseId;
             this.keystorePassword = keystorePassword;
             this.renewAfter = renewAfter;

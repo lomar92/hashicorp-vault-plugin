@@ -91,11 +91,13 @@ public class VaultPKICredentialsImplTest {
         Instant renewAfter = Instant.now().plusSeconds(3540);
         VaultPKICredentialsImpl.IssuedCertificate issued =
             new VaultPKICredentialsImpl.IssuedCertificate(
-                "cert-pem", "key-pem", "ca-pem", "lease-abc-123", "ks-pass", renewAfter);
+                "cert-pem", "key-pem", "ca-pem", "ca-chain-pem",
+                "lease-abc-123", "ks-pass", renewAfter);
 
         assertEquals("cert-pem", issued.certificatePem);
         assertEquals("key-pem", issued.privateKeyPem);
         assertEquals("ca-pem", issued.issuingCaPem);
+        assertEquals("ca-chain-pem", issued.caChainPem);
         assertEquals("lease-abc-123", issued.leaseId);
         assertEquals("ks-pass", issued.keystorePassword);
         assertEquals(renewAfter, issued.renewAfter);

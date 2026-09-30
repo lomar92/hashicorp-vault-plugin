@@ -104,10 +104,12 @@ public class VaultPKICredentialsBinding extends MultiBinding<VaultPKICredentials
 
         VaultPKICredentials credentials = getCredentials(build);
 
-        // Retrieve all PEM data in one shot – all three calls hit the same cached issuance
+        // Retrieve all PEM data in one shot – all three calls hit the same cached issuance.
+        // getCaChainPem() returns the full CA chain (intermediate + root) so openssl verify
+        // and mTLS clients work without needing to install the root CA separately.
         String certPem = credentials.getCertificatePem();
         String keyPem = credentials.getPrivateKeyPem();
-        String caPem = credentials.getIssuingCaPem();
+        String caPem = credentials.getCaChainPem();
 
         listener.getLogger().println("[VaultPKI] Writing PKI certificate PEM files to workspace");
 
