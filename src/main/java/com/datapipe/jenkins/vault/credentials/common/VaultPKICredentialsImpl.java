@@ -25,6 +25,7 @@ import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.security.spec.PKCS8EncodedKeySpec;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
@@ -267,14 +268,12 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
     /**
      * Returns the cached {@link IssuedCertificate}, issuing a new one if necessary.
      *
-     * <p>The {@link IssuedCertificate} is transient, so it is always re-issued after a Jenkins
-     * restart or after the credential object is deserialized.  All three PEM accessors
-     * ({@link #getCertificatePem()}, {@link #getPrivateKeyPem()}, {@link #getIssuingCaPem()}) and
-     * {@link #getKeyStore()} / {@link #getPassword()} share the same issuance, guaranteeing
-     * consistency within a single JVM session.</p>
+     * <p>The cache is invalidated automatically when the certificate is within 60 seconds of its
+     * {@code notAfter} expiry (read directly from the X.509 certificate), ensuring that a fresh
+     * certificate is always returned before the current one expires.</p>
      */
     private synchronized IssuedCertificate getOrIssue() {
-        if (issuedCertificate == null) {
+        if (issuedCertificate == null || Instant.now().isAfter(issuedCertificate.renewAfter)) {
             issuedCertificate = issueCertificate();
         }
         return issuedCertificate;
@@ -328,8 +327,25 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
             "Successfully obtained PKI certificate from Vault: path=%s lease_id=%s",
             issuePath, leaseId));
 
+        Instant renewAfter = parseCertExpiry(certPem).minusSeconds(60);
         return new IssuedCertificate(certPem, keyPem, caPem, leaseId,
-            UUID.randomUUID().toString());
+            UUID.randomUUID().toString(), renewAfter);
+    }
+
+    /**
+     * Extracts the {@code notAfter} expiry from a PEM-encoded X.509 certificate.
+     * Falls back to 30 minutes from now if the certificate cannot be parsed.
+     */
+    private static Instant parseCertExpiry(String certPem) {
+        try {
+            CertificateFactory cf = CertificateFactory.getInstance("X.509");
+            X509Certificate cert = (X509Certificate) cf.generateCertificate(
+                new ByteArrayInputStream(certPem.getBytes(StandardCharsets.UTF_8)));
+            return cert.getNotAfter().toInstant();
+        } catch (Exception e) {
+            LOGGER.warning("Could not parse certificate expiry, defaulting to 30 minutes: " + e.getMessage());
+            return Instant.now().plusSeconds(1800);
+        }
     }
 
     private static String requireData(Map<String, String> data, String key, String path) {
@@ -507,14 +523,20 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
         final String leaseId;
         /** Internal PKCS12 keystore password (not exposed to users). */
         final String keystorePassword;
+        /**
+         * Time after which the cache should be considered stale (certificate notAfter minus 60s).
+         * {@link #getOrIssue()} re-issues when {@code Instant.now()} is past this point.
+         */
+        final Instant renewAfter;
 
         IssuedCertificate(String certificatePem, String privateKeyPem, String issuingCaPem,
-            String leaseId, String keystorePassword) {
+            String leaseId, String keystorePassword, Instant renewAfter) {
             this.certificatePem = certificatePem;
             this.privateKeyPem = privateKeyPem;
             this.issuingCaPem = issuingCaPem;
             this.leaseId = leaseId;
             this.keystorePassword = keystorePassword;
+            this.renewAfter = renewAfter;
         }
     }
 

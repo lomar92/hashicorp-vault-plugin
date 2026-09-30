@@ -4,6 +4,7 @@ import com.datapipe.jenkins.vault.exception.VaultPluginException;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.PrivateKey;
+import java.time.Instant;
 import java.util.Base64;
 import org.junit.Test;
 
@@ -87,15 +88,17 @@ public class VaultPKICredentialsImplTest {
 
     @Test
     public void issuedCertificate_storesAllFieldsConsistently() {
+        Instant renewAfter = Instant.now().plusSeconds(3540);
         VaultPKICredentialsImpl.IssuedCertificate issued =
             new VaultPKICredentialsImpl.IssuedCertificate(
-                "cert-pem", "key-pem", "ca-pem", "lease-abc-123", "ks-pass");
+                "cert-pem", "key-pem", "ca-pem", "lease-abc-123", "ks-pass", renewAfter);
 
         assertEquals("cert-pem", issued.certificatePem);
         assertEquals("key-pem", issued.privateKeyPem);
         assertEquals("ca-pem", issued.issuingCaPem);
         assertEquals("lease-abc-123", issued.leaseId);
         assertEquals("ks-pass", issued.keystorePassword);
+        assertEquals(renewAfter, issued.renewAfter);
     }
 
     // ---- VaultPKICredentialsImpl field defaults --------------------------------
