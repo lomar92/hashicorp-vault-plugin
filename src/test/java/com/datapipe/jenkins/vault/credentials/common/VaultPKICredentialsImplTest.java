@@ -2,6 +2,10 @@ package com.datapipe.jenkins.vault.credentials.common;
 
 import com.datapipe.jenkins.vault.exception.VaultPluginException;
 import hudson.util.Secret;
+import io.github.jopenlibs.vault.api.Logical;
+import io.github.jopenlibs.vault.response.LogicalResponse;
+import io.github.jopenlibs.vault.rest.RestResponse;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.PrivateKey;
@@ -104,6 +108,32 @@ public class VaultPKICredentialsImplTest {
         assertEquals(renewAfter, issued.renewAfter);
     }
 
+    // ---- checkResponseStatus ---------------------------------------------------
+
+    @Test
+    public void checkResponseStatus_success_doesNotThrow() {
+        VaultPKICredentialsImpl.checkResponseStatus(response(200, "{\"data\":{}}"), "pki/issue/r");
+    }
+
+    @Test
+    public void checkResponseStatus_vaultError_includesVaultMessage() {
+        VaultPluginException ex = assertThrows(VaultPluginException.class,
+            () -> VaultPKICredentialsImpl.checkResponseStatus(
+                response(400, "{\"errors\":[\"unknown role: nope\"]}"), "pki/issue/nope"));
+
+        assertTrue(ex.getMessage(), ex.getMessage().contains("HTTP 400"));
+        assertTrue(ex.getMessage(), ex.getMessage().contains("unknown role: nope"));
+    }
+
+    @Test
+    public void checkResponseStatus_nonJsonBody_reportsStatusOnly() {
+        VaultPluginException ex = assertThrows(VaultPluginException.class,
+            () -> VaultPKICredentialsImpl.checkResponseStatus(
+                response(503, "<html>unavailable</html>"), "pki/issue/r"));
+
+        assertTrue(ex.getMessage(), ex.getMessage().contains("HTTP 503"));
+    }
+
     // ---- VaultPKICredentialsImpl field defaults --------------------------------
 
     @Test
@@ -155,5 +185,11 @@ public class VaultPKICredentialsImplTest {
         return "-----BEGIN PRIVATE KEY-----\n"
             + Base64.getMimeEncoder(64, new byte[]{'\n'}).encodeToString(key.getEncoded())
             + "\n-----END PRIVATE KEY-----";
+    }
+
+    private static LogicalResponse response(int status, String body) {
+        RestResponse rest = new RestResponse(status, "application/json",
+            body.getBytes(StandardCharsets.UTF_8));
+        return new LogicalResponse(rest, 0, Logical.logicalOperations.writeV1);
     }
 }

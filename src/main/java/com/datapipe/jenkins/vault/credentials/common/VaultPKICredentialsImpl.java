@@ -11,10 +11,12 @@ import hudson.model.Item;
 import hudson.model.ItemGroup;
 import hudson.util.FormValidation;
 import hudson.util.Secret;
+import io.github.jopenlibs.vault.json.Json;
 import io.github.jopenlibs.vault.json.JsonArray;
 import io.github.jopenlibs.vault.json.JsonObject;
 import io.github.jopenlibs.vault.json.JsonValue;
 import io.github.jopenlibs.vault.response.LogicalResponse;
+import io.github.jopenlibs.vault.rest.RestResponse;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -41,6 +43,7 @@ import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import org.apache.commons.lang3.StringUtils;
+import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
@@ -82,7 +85,6 @@ import static org.apache.commons.lang3.StringUtils.isNotBlank;
  * }
  * }</pre>
  */
-@SuppressWarnings("ALL")
 public class VaultPKICredentialsImpl extends BaseStandardCredentials implements VaultPKICredentials {
 
     private static final Logger LOGGER = Logger.getLogger(VaultPKICredentialsImpl.class.getName());
@@ -329,6 +331,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
             issuePath, commonName, getTtl()));
 
         LogicalResponse response = writeVaultSecret(issuePath, params, namespace, context);
+        checkResponseStatus(response, issuePath);
         Map<String, String> data = response.getData();
 
         String certPem = requireData(data, "certificate", issuePath);
@@ -338,8 +341,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
         String leaseId = response.getLeaseId();
 
         LOGGER.info(String.format(
-            "Successfully obtained PKI certificate from Vault: path=%s lease_id=%s",
-            issuePath, leaseId));
+            "Successfully obtained PKI certificate from Vault: path=%s", issuePath));
 
         Instant renewAfter = parseCertExpiry(certPem).minusSeconds(60);
         return new IssuedCertificate(certPem, Secret.fromString(keyPem), caPem, caChainPem,
@@ -400,6 +402,36 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
                 + e.getMessage());
             return issuingCaPem;
         }
+    }
+
+    /**
+     * Fails with Vault's own error messages when the issue request was rejected (HTTP 4xx/5xx),
+     * e.g. an unknown role or a common name the role does not allow.
+     */
+    static void checkResponseStatus(LogicalResponse response, String path) {
+        RestResponse restResponse = response.getRestResponse();
+        if (restResponse == null || restResponse.getStatus() < 400) {
+            return;
+        }
+        String detail = "";
+        try {
+            byte[] body = restResponse.getBody();
+            if (body != null && body.length > 0) {
+                JsonValue errors = Json.parse(new String(body, StandardCharsets.UTF_8))
+                    .asObject().get("errors");
+                if (errors != null && errors.isArray()) {
+                    List<String> messages = new ArrayList<>();
+                    for (JsonValue v : errors.asArray().values()) {
+                        messages.add(v.asString());
+                    }
+                    detail = ": " + String.join("; ", messages);
+                }
+            }
+        } catch (Exception ignored) {
+            // body is not the usual {"errors": [...]} JSON - report the status code only
+        }
+        throw new VaultPluginException(String.format(
+            "Vault rejected the request to '%s' (HTTP %d)%s", path, restResponse.getStatus(), detail));
     }
 
     private static String requireData(Map<String, String> data, String key, String path) {
@@ -617,6 +649,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
 
     // ---- Jenkins descriptor ----------------------------------------------------
 
+    @Symbol("vaultPKICert")
     @Extension
     public static class DescriptorImpl extends BaseStandardCredentialsDescriptor {
 
@@ -669,6 +702,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
 
                 LogicalResponse response = writeVaultSecret(issuePath, params,
                     Util.fixEmptyAndTrim(namespace), context);
+                checkResponseStatus(response, issuePath);
                 Map<String, String> data = response.getData();
 
                 if (data == null || data.get("certificate") == null) {
