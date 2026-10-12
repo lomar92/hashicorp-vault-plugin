@@ -8,17 +8,28 @@ import hudson.model.Result;
 import hudson.model.Run;
 import hudson.util.Secret;
 import java.io.InputStream;
+import java.net.URL;
 import java.security.KeyStore;
+import jenkins.model.Jenkins;
+import org.htmlunit.HttpMethod;
+import org.htmlunit.WebRequest;
+import org.htmlunit.WebResponse;
 import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition;
 import org.jenkinsci.plugins.workflow.job.WorkflowJob;
 import org.jenkinsci.plugins.workflow.job.WorkflowRun;
 import org.junit.Rule;
 import org.junit.Test;
+import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.MockAuthorizationStrategy;
 import org.jvnet.hudson.test.RestartableJenkinsRule;
 
 import static com.datapipe.jenkins.vault.it.VaultConfigurationIT.getShellString;
 import static com.datapipe.jenkins.vault.it.VaultConfigurationIT.getVariable;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.not;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -195,6 +206,60 @@ public class VaultPKICredentialsIT {
 
             WorkflowRun b = job.scheduleBuild2(0).waitForStart();
             r.assertBuildStatus(Result.FAILURE, r.waitForCompletion(b));
+        });
+    }
+
+    // ---- Test connection endpoint (CSRF / permission checks) ------------------
+
+    private static final String TEST_CONNECTION_PATH = "descriptorByName/"
+        + VaultPKICredentialsImpl.class.getName() + "/testConnection"
+        + "?pkiRole=&commonName=jenkins.example.com";
+
+    @Test
+    public void testConnectionShouldRejectGet() {
+        story.then(r -> {
+            JenkinsRule.WebClient wc = r.createWebClient();
+            wc.setThrowExceptionOnFailingStatusCode(false);
+
+            WebResponse response = wc.goTo(TEST_CONNECTION_PATH, null).getWebResponse();
+
+            // Stapler does not dispatch GET to a @POST web method (404/405 depending on version)
+            assertNotEquals(200, response.getStatusCode());
+            assertThat(response.getContentAsString(),
+                not(containsString("PKI role must not be blank")));
+        });
+    }
+
+    @Test
+    public void testConnectionShouldAcceptPostWithCrumbForAdmin() {
+        story.then(r -> {
+            JenkinsRule.WebClient wc = r.createWebClient();
+            WebRequest request = new WebRequest(
+                new URL(r.getURL(), TEST_CONNECTION_PATH), HttpMethod.POST);
+
+            WebResponse response = wc.getPage(wc.addCrumb(request)).getWebResponse();
+
+            // Reaching the parameter validation proves the request passed the POST/crumb check
+            assertEquals(200, response.getStatusCode());
+            assertThat(response.getContentAsString(), containsString("PKI role must not be blank"));
+        });
+    }
+
+    @Test
+    public void testConnectionShouldRejectNonAdmin() {
+        story.then(r -> {
+            r.jenkins.setSecurityRealm(r.createDummySecurityRealm());
+            r.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy()
+                .grant(Jenkins.READ).everywhere().to("reader"));
+
+            JenkinsRule.WebClient wc = r.createWebClient().login("reader");
+            wc.setThrowExceptionOnFailingStatusCode(false);
+            WebRequest request = new WebRequest(
+                new URL(r.getURL(), TEST_CONNECTION_PATH), HttpMethod.POST);
+
+            WebResponse response = wc.getPage(wc.addCrumb(request)).getWebResponse();
+
+            assertEquals(403, response.getStatusCode());
         });
     }
 

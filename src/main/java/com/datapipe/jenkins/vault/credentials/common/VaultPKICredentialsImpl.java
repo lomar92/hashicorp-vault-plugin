@@ -45,6 +45,7 @@ import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.verb.POST;
 
 import static com.datapipe.jenkins.vault.credentials.common.VaultHelper.writeVaultSecret;
 import static org.apache.commons.lang3.StringUtils.defaultIfBlank;
@@ -230,7 +231,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
     @Override
     @NonNull
     public String getPrivateKeyPem() {
-        return getOrIssue().privateKeyPem;
+        return getOrIssue().privateKeyPem.getPlainText();
     }
 
     @Override
@@ -254,9 +255,9 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
         try {
             return buildKeyStore(
                 issued.certificatePem,
-                issued.privateKeyPem,
+                issued.privateKeyPem.getPlainText(),
                 issued.caChainPem,
-                issued.keystorePassword.toCharArray());
+                issued.keystorePassword.getPlainText().toCharArray());
         } catch (Exception e) {
             LogRecord lr = new LogRecord(Level.WARNING,
                 "Credentials ID {0}: Could not build PKCS12 keystore from Vault PKI certificate");
@@ -272,7 +273,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
     @NonNull
     @Override
     public Secret getPassword() {
-        return Secret.fromString(getOrIssue().keystorePassword);
+        return getOrIssue().keystorePassword;
     }
 
     // ---- internal certificate issuance -----------------------------------------
@@ -341,8 +342,8 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
             issuePath, leaseId));
 
         Instant renewAfter = parseCertExpiry(certPem).minusSeconds(60);
-        return new IssuedCertificate(certPem, keyPem, caPem, caChainPem, leaseId,
-            UUID.randomUUID().toString(), renewAfter);
+        return new IssuedCertificate(certPem, Secret.fromString(keyPem), caPem, caChainPem,
+            Secret.fromString(leaseId), Secret.fromString(UUID.randomUUID().toString()), renewAfter);
     }
 
     /**
@@ -584,7 +585,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
      */
     static final class IssuedCertificate {
         final String certificatePem;
-        final String privateKeyPem;
+        final Secret privateKeyPem;
         /** The direct issuer certificate ({@code issuing_ca} field from Vault). */
         final String issuingCaPem;
         /**
@@ -593,17 +594,17 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
          */
         final String caChainPem;
         /** Vault lease ID – can be used for early revocation. */
-        final String leaseId;
+        final Secret leaseId;
         /** Internal PKCS12 keystore password (not exposed to users). */
-        final String keystorePassword;
+        final Secret keystorePassword;
         /**
          * Time after which the cache should be considered stale (certificate notAfter minus 60s).
          * {@link #getOrIssue()} re-issues when {@code Instant.now()} is past this point.
          */
         final Instant renewAfter;
 
-        IssuedCertificate(String certificatePem, String privateKeyPem, String issuingCaPem,
-            String caChainPem, String leaseId, String keystorePassword, Instant renewAfter) {
+        IssuedCertificate(String certificatePem, Secret privateKeyPem, String issuingCaPem,
+            String caChainPem, Secret leaseId, Secret keystorePassword, Instant renewAfter) {
             this.certificatePem = certificatePem;
             this.privateKeyPem = privateKeyPem;
             this.issuingCaPem = issuingCaPem;
@@ -632,6 +633,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
             return DEFAULT_TTL;
         }
 
+        @POST
         public FormValidation doTestConnection(
             @AncestorInPath ItemGroup<Item> context,
             @QueryParameter("pkiMount") String pkiMount,
@@ -673,8 +675,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
                     return FormValidation.error(
                         "Vault returned a response but 'certificate' field was missing");
                 }
-                return FormValidation.ok(
-                    "Successfully issued certificate from Vault PKI (lease_id=" + response.getLeaseId() + ")");
+                return FormValidation.ok("Successfully issued certificate from Vault PKI");
             } catch (Exception e) {
                 return FormValidation.error("FAILED to issue PKI certificate: " + e.getMessage());
             }

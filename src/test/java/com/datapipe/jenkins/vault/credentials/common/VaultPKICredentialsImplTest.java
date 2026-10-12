@@ -1,6 +1,7 @@
 package com.datapipe.jenkins.vault.credentials.common;
 
 import com.datapipe.jenkins.vault.exception.VaultPluginException;
+import hudson.util.Secret;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.PrivateKey;
@@ -91,15 +92,15 @@ public class VaultPKICredentialsImplTest {
         Instant renewAfter = Instant.now().plusSeconds(3540);
         VaultPKICredentialsImpl.IssuedCertificate issued =
             new VaultPKICredentialsImpl.IssuedCertificate(
-                "cert-pem", "key-pem", "ca-pem", "ca-chain-pem",
-                "lease-abc-123", "ks-pass", renewAfter);
+                "cert-pem", Secret.fromString("key-pem"), "ca-pem", "ca-chain-pem",
+                Secret.fromString("lease-abc-123"), Secret.fromString("ks-pass"), renewAfter);
 
         assertEquals("cert-pem", issued.certificatePem);
-        assertEquals("key-pem", issued.privateKeyPem);
+        assertEquals("key-pem", issued.privateKeyPem.getPlainText());
         assertEquals("ca-pem", issued.issuingCaPem);
         assertEquals("ca-chain-pem", issued.caChainPem);
-        assertEquals("lease-abc-123", issued.leaseId);
-        assertEquals("ks-pass", issued.keystorePassword);
+        assertEquals("lease-abc-123", issued.leaseId.getPlainText());
+        assertEquals("ks-pass", issued.keystorePassword.getPlainText());
         assertEquals(renewAfter, issued.renewAfter);
     }
 

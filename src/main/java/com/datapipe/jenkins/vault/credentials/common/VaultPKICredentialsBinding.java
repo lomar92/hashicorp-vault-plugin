@@ -45,12 +45,19 @@ import static org.apache.commons.lang3.StringUtils.isNotBlank;
  */
 public class VaultPKICredentialsBinding extends MultiBinding<VaultPKICredentials> {
 
+    // The following constants and fields hold environment variable names, not secrets.
+    @SuppressWarnings("lgtm[jenkins/plaintext-storage-of-password]")
     public static final String DEFAULT_CERT_PEM_VARIABLE = "VAULT_PKI_CERT";
+    @SuppressWarnings("lgtm[jenkins/plaintext-storage-of-password]")
     public static final String DEFAULT_KEY_PEM_VARIABLE = "VAULT_PKI_KEY";
+    @SuppressWarnings("lgtm[jenkins/plaintext-storage-of-password]")
     public static final String DEFAULT_CA_PEM_VARIABLE = "VAULT_PKI_CA";
 
+    @SuppressWarnings("lgtm[jenkins/plaintext-storage-of-password]")
     private String certPemVariable;
+    @SuppressWarnings("lgtm[jenkins/plaintext-storage-of-password]")
     private String privateKeyPemVariable;
+    @SuppressWarnings("lgtm[jenkins/plaintext-storage-of-password]")
     private String caPemVariable;
 
     @DataBoundConstructor
