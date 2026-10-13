@@ -5,6 +5,7 @@ import com.cloudbees.plugins.credentials.NameWith;
 import com.cloudbees.plugins.credentials.common.StandardCertificateCredentials;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Util;
+import hudson.util.Secret;
 
 /**
  * Vault PKI secrets engine credential.
@@ -25,8 +26,7 @@ public interface VaultPKICredentials extends StandardCertificateCredentials {
 
     /**
      * PEM-encoded X.509 certificate issued by the Vault PKI engine.
-     * Consistent with {@link #getPrivateKeyPem()} and {@link #getIssuingCaPem()} –
-     * all three originate from the same Vault issuance call.
+     * Use {@link #getCertificateBundle()} when the matching private key is needed as well.
      *
      * @return PEM string starting with {@code -----BEGIN CERTIFICATE-----}
      */
@@ -59,6 +59,21 @@ public interface VaultPKICredentials extends StandardCertificateCredentials {
      * @return concatenated PEM string with one or more {@code -----BEGIN CERTIFICATE-----} blocks
      */
     String getCaChainPem();
+
+    /**
+     * Certificate, private key and CA certificates of one single issuance.
+     *
+     * <p>Prefer this over calling {@link #getCertificatePem()}, {@link #getPrivateKeyPem()} and
+     * {@link #getCaChainPem()} one after another: the cached certificate may be renewed between
+     * those calls, which would mix material of two different issuances.</p>
+     *
+     * @return consistent PEM material of a single Vault issuance
+     */
+    @NonNull
+    default VaultPKICertificateBundle getCertificateBundle() {
+        return new VaultPKICertificateBundle(getCertificatePem(),
+            Secret.fromString(getPrivateKeyPem()), getIssuingCaPem(), getCaChainPem());
+    }
 
     class NameProvider extends CredentialsNameProvider<VaultPKICredentials> {
         @NonNull

@@ -5,15 +5,26 @@ import hudson.util.Secret;
 import io.github.jopenlibs.vault.api.Logical;
 import io.github.jopenlibs.vault.response.LogicalResponse;
 import io.github.jopenlibs.vault.rest.RestResponse;
+import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.security.KeyStore;
 import java.security.PrivateKey;
+import java.security.Signature;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
+import javax.security.auth.x500.X500Principal;
 import org.junit.Test;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -43,26 +54,13 @@ public class VaultPKICredentialsImplTest {
     // ---- parsePrivateKey – PKCS#1 RSA (legacy Vault / custom config) ----------
 
     @Test
-    public void parsePrivateKey_pkcs1RsaHeader_triggersWrapperPath() throws Exception {
-        // Build a PKCS#1-labelled PEM from PKCS#8 DER bytes.
-        // The raw DER for a PKCS#8 RSA key contains the PKCS#1 structure nested inside it;
-        // our wrapper adds a PKCS#8 shell, so passing PKCS#8 bytes with a PKCS#1 header
-        // exercises the error-handling of the wrapping path (double-wrapping fails gracefully).
-        KeyPair kp = generateRsaKeyPair();
-        String fakeRsaPem = "-----BEGIN RSA PRIVATE KEY-----\n"
-            + Base64.getMimeEncoder(64, new byte[]{'\n'})
-                .encodeToString(kp.getPrivate().getEncoded())
-            + "\n-----END RSA PRIVATE KEY-----";
+    public void parsePrivateKey_genuinePkcs1Rsa_matchesPkcs8Encoding() throws Exception {
+        PrivateKey fromPkcs1 = VaultPKICredentialsImpl.parsePrivateKey(fixture("leaf-key-pkcs1.pem"));
+        PrivateKey fromPkcs8 = VaultPKICredentialsImpl.parsePrivateKey(fixture("leaf-key-pkcs8.pem"));
 
-        // We expect either success (if the JVM accepts it) or a VaultPluginException with a
-        // clear message – never a NullPointerException or ClassCastException.
-        try {
-            PrivateKey key = VaultPKICredentialsImpl.parsePrivateKey(fakeRsaPem);
-            assertNotNull(key);
-        } catch (VaultPluginException e) {
-            assertTrue("Exception message should mention RSA or PKCS#1",
-                e.getMessage().contains("RSA") || e.getMessage().contains("PKCS"));
-        }
+        assertEquals("RSA", fromPkcs1.getAlgorithm());
+        assertArrayEquals("PKCS#1 and PKCS#8 encodings must yield the same key",
+            fromPkcs8.getEncoded(), fromPkcs1.getEncoded());
     }
 
     // ---- parsePrivateKey – unsupported formats --------------------------------
@@ -94,18 +92,124 @@ public class VaultPKICredentialsImplTest {
     @Test
     public void issuedCertificate_storesAllFieldsConsistently() {
         Instant renewAfter = Instant.now().plusSeconds(3540);
+        VaultPKICertificateBundle bundle = new VaultPKICertificateBundle(
+            "cert-pem", Secret.fromString("key-pem"), "ca-pem", "ca-chain-pem");
         VaultPKICredentialsImpl.IssuedCertificate issued =
             new VaultPKICredentialsImpl.IssuedCertificate(
-                "cert-pem", Secret.fromString("key-pem"), "ca-pem", "ca-chain-pem",
-                Secret.fromString("lease-abc-123"), Secret.fromString("ks-pass"), renewAfter);
+                bundle, Secret.fromString("lease-abc-123"), renewAfter);
 
-        assertEquals("cert-pem", issued.certificatePem);
-        assertEquals("key-pem", issued.privateKeyPem.getPlainText());
-        assertEquals("ca-pem", issued.issuingCaPem);
-        assertEquals("ca-chain-pem", issued.caChainPem);
+        assertEquals("cert-pem", issued.bundle.getCertificatePem());
+        assertEquals("key-pem", issued.bundle.getPrivateKeyPem().getPlainText());
+        assertEquals("ca-pem", issued.bundle.getIssuingCaPem());
+        assertEquals("ca-chain-pem", issued.bundle.getCaChainPem());
         assertEquals("lease-abc-123", issued.leaseId.getPlainText());
-        assertEquals("ks-pass", issued.keystorePassword.getPlainText());
         assertEquals(renewAfter, issued.renewAfter);
+    }
+
+    // ---- buildKeyStore – full intermediate/root chain --------------------------
+
+    @Test
+    public void buildKeyStore_intermediateChain_storesOrderedChainWithMatchingKey() throws Exception {
+        char[] password = "changeit".toCharArray();
+        KeyStore ks = VaultPKICredentialsImpl.buildKeyStore(fixture("leaf.pem"),
+            fixture("leaf-key-pkcs8.pem"), fixture("ca-chain.pem"), password);
+
+        assertTrue(ks.isKeyEntry("vault-pki"));
+        Certificate[] chain = ks.getCertificateChain("vault-pki");
+        assertEquals("leaf, intermediate and root expected", 3, chain.length);
+        assertEquals(subject("leaf.pem"), ((X509Certificate) chain[0]).getSubjectX500Principal());
+        assertEquals(subject("intermediate.pem"),
+            ((X509Certificate) chain[1]).getSubjectX500Principal());
+        assertEquals(subject("root.pem"), ((X509Certificate) chain[2]).getSubjectX500Principal());
+        // each certificate must be signed by the next one in the chain
+        chain[0].verify(chain[1].getPublicKey());
+        chain[1].verify(chain[2].getPublicKey());
+        chain[2].verify(chain[2].getPublicKey());
+
+        // the stored private key must belong to the leaf certificate
+        PrivateKey key = (PrivateKey) ks.getKey("vault-pki", password);
+        Signature signer = Signature.getInstance("SHA256withRSA");
+        signer.initSign(key);
+        signer.update(new byte[]{1, 2, 3});
+        byte[] signature = signer.sign();
+        Signature verifier = Signature.getInstance("SHA256withRSA");
+        verifier.initVerify(chain[0].getPublicKey());
+        verifier.update(new byte[]{1, 2, 3});
+        assertTrue("private key does not match the leaf certificate", verifier.verify(signature));
+    }
+
+    @Test
+    public void buildKeyStore_rootOnlyChain_storesLeafAndIssuer() throws Exception {
+        KeyStore ks = VaultPKICredentialsImpl.buildKeyStore(fixture("leaf.pem"),
+            fixture("leaf-key-pkcs1.pem"), fixture("intermediate.pem"), "changeit".toCharArray());
+
+        assertEquals(2, ks.getCertificateChain("vault-pki").length);
+    }
+
+    // ---- computeRenewAfter -------------------------------------------------------
+
+    @Test
+    public void computeRenewAfter_regularLifetime_renewsOneMinuteBeforeExpiry() {
+        Instant issuedAt = Instant.parse("2026-01-01T00:00:00Z");
+        Instant notAfter = issuedAt.plus(Duration.ofHours(1));
+
+        assertEquals(notAfter.minusSeconds(60),
+            VaultPKICredentialsImpl.computeRenewAfter(issuedAt, notAfter));
+    }
+
+    @Test
+    public void computeRenewAfter_shortLifetime_staysBetweenIssuanceAndExpiry() {
+        Instant issuedAt = Instant.parse("2026-01-01T00:00:00Z");
+        Instant notAfter = issuedAt.plusSeconds(40);
+
+        Instant renewAfter = VaultPKICredentialsImpl.computeRenewAfter(issuedAt, notAfter);
+
+        assertEquals(issuedAt.plusSeconds(20), renewAfter);
+        assertTrue(renewAfter.isAfter(issuedAt));
+        assertTrue(renewAfter.isBefore(notAfter));
+    }
+
+    @Test
+    public void computeRenewAfter_alreadyExpired_renewsImmediately() {
+        Instant issuedAt = Instant.parse("2026-01-01T00:00:00Z");
+
+        assertEquals(issuedAt,
+            VaultPKICredentialsImpl.computeRenewAfter(issuedAt, issuedAt.minusSeconds(5)));
+    }
+
+    // ---- buildIssuePath ------------------------------------------------------------
+
+    @Test
+    public void buildIssuePath_validMountAndRole_buildsIssuePath() {
+        assertEquals("pki-int/issue/jenkins",
+            VaultPKICredentialsImpl.buildIssuePath("pki-int", "jenkins"));
+        assertEquals("teams/a/pki_v2/issue/web.client",
+            VaultPKICredentialsImpl.buildIssuePath("teams/a/pki_v2", "web.client"));
+    }
+
+    @Test
+    public void buildIssuePath_traversalOrInjection_isRejected() {
+        String[][] invalid = {
+            {"pki/../sys", "role"}, {"..", "role"}, {"pki/", "role"}, {"/pki", "role"},
+            {"pki", "../../sys/policy/x"}, {"pki", "a/b"}, {"pki", ".."}, {"pki", "r?x=1"},
+            {"pki", "r#x"}, {"pki", "r%2e%2e"}, {"pki", ""}, {"", "role"}, {null, "role"},
+            {"pki", null}
+        };
+        for (String[] c : invalid) {
+            assertThrows("expected rejection of mount=" + c[0] + " role=" + c[1],
+                VaultPluginException.class, () -> VaultPKICredentialsImpl.buildIssuePath(c[0], c[1]));
+        }
+    }
+
+    // ---- keystore password -----------------------------------------------------------
+
+    @Test
+    public void getPassword_isStablePerCredentialInstance() {
+        VaultPKICredentialsImpl cred = new VaultPKICredentialsImpl(null, "id", "desc");
+
+        assertEquals(cred.getPassword().getPlainText(), cred.getPassword().getPlainText());
+        assertNotEquals(cred.getPassword().getPlainText(),
+            new VaultPKICredentialsImpl(null, "id2", "desc").getPassword().getPlainText());
     }
 
     // ---- checkResponseStatus ---------------------------------------------------
@@ -191,5 +295,18 @@ public class VaultPKICredentialsImplTest {
         RestResponse rest = new RestResponse(status, "application/json",
             body.getBytes(StandardCharsets.UTF_8));
         return new LogicalResponse(rest, 0, Logical.logicalOperations.writeV1);
+    }
+
+    private static String fixture(String name) throws Exception {
+        try (InputStream in = VaultPKICredentialsImplTest.class.getResourceAsStream("pki/" + name)) {
+            assertNotNull("missing test fixture " + name, in);
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
+
+    private static X500Principal subject(String name) throws Exception {
+        return ((X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(
+            new ByteArrayInputStream(fixture(name).getBytes(StandardCharsets.UTF_8))))
+            .getSubjectX500Principal();
     }
 }

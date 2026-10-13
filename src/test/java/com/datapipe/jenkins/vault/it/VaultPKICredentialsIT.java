@@ -1,15 +1,24 @@
 package com.datapipe.jenkins.vault.it;
 
+import com.cloudbees.hudson.plugins.folder.Folder;
+import com.cloudbees.hudson.plugins.folder.properties.FolderCredentialsProvider;
+import com.cloudbees.plugins.credentials.CredentialsMatchers;
 import com.cloudbees.plugins.credentials.CredentialsProvider;
+import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.cloudbees.plugins.credentials.domains.Domain;
+import com.cloudbees.plugins.credentials.domains.DomainCredentials;
+import com.datapipe.jenkins.vault.credentials.common.VaultPKICertificateBundle;
 import com.datapipe.jenkins.vault.credentials.common.VaultPKICredentials;
 import com.datapipe.jenkins.vault.credentials.common.VaultPKICredentialsImpl;
+import hudson.Functions;
 import hudson.model.Result;
 import hudson.model.Run;
+import hudson.security.ACL;
 import hudson.util.Secret;
 import java.io.InputStream;
 import java.net.URL;
 import java.security.KeyStore;
+import java.util.Collections;
 import jenkins.model.Jenkins;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
@@ -30,6 +39,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
@@ -105,10 +115,9 @@ public class VaultPKICredentialsIT {
             VaultPKICredentials cred = mock(VaultPKICredentialsImpl.class);
             when(cred.forRun(any(Run.class))).thenReturn(cred);
             when(cred.getId()).thenReturn(credentialsId);
-            when(cred.getCertificatePem()).thenReturn(fakeCertPem);
-            when(cred.getPrivateKeyPem()).thenReturn(fakeKeyPem);
-            when(cred.getIssuingCaPem()).thenReturn(fakeCaPem);
-            when(cred.getCaChainPem()).thenReturn(fakeCaPem);
+            // Only the bundle is stubbed: the binding must take all PEM material from one snapshot
+            when(cred.getCertificateBundle()).thenReturn(new VaultPKICertificateBundle(
+                fakeCertPem, Secret.fromString(fakeKeyPem), fakeCaPem, fakeCaPem));
             when(cred.getKeyStore()).thenReturn(ks);
             when(cred.getPassword()).thenReturn(Secret.fromString(KS_PASSWORD));
 
@@ -126,6 +135,8 @@ public class VaultPKICredentialsIT {
                 + "    " + getShellString() + " 'test -f \"" + getVariable("KEY_FILE") + "\"'\n"
                 + "    " + getShellString() + " 'test -f \"" + getVariable("CA_FILE") + "\"'\n"
                 + "    " + getShellString() + " 'cat \"" + getVariable("CERT_FILE") + "\" > cert_out.txt'\n"
+                + (Functions.isWindows() ? ""
+                    : "    sh 'ls -l \"$KEY_FILE\" | cut -c1-10 > key_mode.txt'\n")
                 + "  }\n"
                 + "}", true));
 
@@ -136,6 +147,11 @@ public class VaultPKICredentialsIT {
                 .readToString().trim();
             assertTrue("cert_out.txt should contain the certificate PEM",
                 certOut.contains("BEGIN CERTIFICATE"));
+            if (!Functions.isWindows()) {
+                String keyMode = r.jenkins.getWorkspaceFor(job).child("key_mode.txt")
+                    .readToString().trim();
+                assertEquals("private key file must be owner read-only", "-r--------", keyMode);
+            }
         });
     }
 
@@ -153,10 +169,10 @@ public class VaultPKICredentialsIT {
             VaultPKICredentials cred = mock(VaultPKICredentialsImpl.class);
             when(cred.forRun(any(Run.class))).thenReturn(cred);
             when(cred.getId()).thenReturn(credentialsId);
-            when(cred.getCertificatePem()).thenReturn(fakeCertPem);
-            when(cred.getPrivateKeyPem()).thenReturn("-----BEGIN PRIVATE KEY-----\nZg==\n-----END PRIVATE KEY-----");
-            when(cred.getIssuingCaPem()).thenReturn("-----BEGIN CERTIFICATE-----\nZg==\n-----END CERTIFICATE-----");
-            when(cred.getCaChainPem()).thenReturn("-----BEGIN CERTIFICATE-----\nZg==\n-----END CERTIFICATE-----");
+            when(cred.getCertificateBundle()).thenReturn(new VaultPKICertificateBundle(fakeCertPem,
+                Secret.fromString("-----BEGIN PRIVATE KEY-----\nZg==\n-----END PRIVATE KEY-----"),
+                "-----BEGIN CERTIFICATE-----\nZg==\n-----END CERTIFICATE-----",
+                "-----BEGIN CERTIFICATE-----\nZg==\n-----END CERTIFICATE-----"));
             when(cred.getKeyStore()).thenReturn(ks);
             when(cred.getPassword()).thenReturn(Secret.fromString(KS_PASSWORD));
 
@@ -206,6 +222,33 @@ public class VaultPKICredentialsIT {
 
             WorkflowRun b = job.scheduleBuild2(0).waitForStart();
             r.assertBuildStatus(Result.FAILURE, r.waitForCompletion(b));
+        });
+    }
+
+    // ---- Folder context ----------------------------------------------------------
+
+    @Test
+    public void folderScopedCredentialShouldResolveVaultConfigOfItsFolder() {
+        story.then(r -> {
+            Folder folder = r.jenkins.createProject(Folder.class, "team-a");
+            VaultPKICredentialsImpl cred = new VaultPKICredentialsImpl(CredentialsScope.GLOBAL,
+                "folder-pki", "folder PKI credential");
+            cred.setPkiRole("jenkins");
+            cred.setCommonName("jenkins.example.com");
+            folder.addProperty(new FolderCredentialsProvider.FolderCredentialsProperty(
+                new DomainCredentials[]{
+                    new DomainCredentials(Domain.global(), Collections.singletonList(cred))}));
+            WorkflowJob job = folder.createProject(WorkflowJob.class, "job");
+
+            // Same lookup that withCredentials performs for a build of the job (as SYSTEM)
+            VaultPKICredentials found = CredentialsMatchers.firstOrNull(
+                CredentialsProvider.lookupCredentialsInItem(VaultPKICredentials.class, job,
+                    ACL.SYSTEM2, Collections.emptyList()),
+                CredentialsMatchers.withId("folder-pki"));
+
+            assertSame(cred, found);
+            assertSame("credential must use the folder's Vault configuration",
+                folder, ((VaultPKICredentialsImpl) found).getContext());
         });
     }
 

@@ -30,6 +30,7 @@ import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.security.spec.PKCS8EncodedKeySpec;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -41,6 +42,7 @@ import java.util.UUID;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import java.util.regex.Pattern;
 import jenkins.model.Jenkins;
 import org.apache.commons.lang3.StringUtils;
 import org.jenkinsci.Symbol;
@@ -67,7 +69,6 @@ import static org.apache.commons.lang3.StringUtils.isNotBlank;
  *   <li>Each PKI role should have the minimum set of allowed domains / IP SANs.</li>
  *   <li>The Vault policy for the Jenkins AppRole/token should be scoped to
  *       {@code pki/issue/<role>} only.</li>
- *   <li>Vault leases are revoked when the credential is invalidated (best-effort).</li>
  * </ul>
  *
  * <h2>Usage in pipeline</h2>
@@ -85,7 +86,8 @@ import static org.apache.commons.lang3.StringUtils.isNotBlank;
  * }
  * }</pre>
  */
-public class VaultPKICredentialsImpl extends BaseStandardCredentials implements VaultPKICredentials {
+public class VaultPKICredentialsImpl extends BaseStandardCredentials
+    implements VaultPKICredentials, VaultContextualCredentials {
 
     private static final Logger LOGGER = Logger.getLogger(VaultPKICredentialsImpl.class.getName());
     private static final long serialVersionUID = 1L;
@@ -95,6 +97,22 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
 
     /** Default certificate TTL – short-lived to limit blast radius. */
     public static final String DEFAULT_TTL = "1h";
+
+    /** Renew the cached certificate this long before it expires (capped at half its lifetime). */
+    static final Duration RENEWAL_MARGIN = Duration.ofSeconds(60);
+
+    /**
+     * One Vault path segment: letters, digits, {@code -} and {@code _}, optionally separated by
+     * single dots.  This rules out {@code .} and {@code ..} segments (path traversal).
+     */
+    private static final String PATH_SEGMENT = "[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*";
+
+    /** A PKI mount path: one or more path segments separated by {@code /}. */
+    private static final Pattern MOUNT_PATTERN =
+        Pattern.compile(PATH_SEGMENT + "(?:/" + PATH_SEGMENT + ")*");
+
+    /** A PKI role name: exactly one path segment. */
+    private static final Pattern ROLE_PATTERN = Pattern.compile(PATH_SEGMENT);
 
     // ---- user-configurable fields -----------------------------------------------
 
@@ -126,6 +144,13 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
 
     /** Lazily-issued certificate data, cached within a single JVM lifecycle. */
     private transient volatile IssuedCertificate issuedCertificate;
+
+    /**
+     * Password of the PKCS12 keystore handed out by {@link #getKeyStore()}.  Kept per credential
+     * instance (not per issuance) so that {@link #getKeyStore()} and {@link #getPassword()} always
+     * match, even if the certificate is renewed between the two calls.
+     */
+    private transient volatile Secret keystorePassword;
 
     /** Jenkins item context used to resolve Vault configuration. */
     private transient ItemGroup context;
@@ -209,10 +234,12 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
         this.namespace = Util.fixEmptyAndTrim(namespace);
     }
 
+    @Override
     public void setContext(@NonNull ItemGroup context) {
         this.context = context;
     }
 
+    @Override
     public ItemGroup getContext() {
         return context;
     }
@@ -227,25 +254,31 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
     @Override
     @NonNull
     public String getCertificatePem() {
-        return getOrIssue().certificatePem;
+        return getOrIssue().bundle.getCertificatePem();
     }
 
     @Override
     @NonNull
     public String getPrivateKeyPem() {
-        return getOrIssue().privateKeyPem.getPlainText();
+        return getOrIssue().bundle.getPrivateKeyPem().getPlainText();
     }
 
     @Override
     @NonNull
     public String getIssuingCaPem() {
-        return getOrIssue().issuingCaPem;
+        return getOrIssue().bundle.getIssuingCaPem();
     }
 
     @Override
     @NonNull
     public String getCaChainPem() {
-        return getOrIssue().caChainPem;
+        return getOrIssue().bundle.getCaChainPem();
+    }
+
+    @Override
+    @NonNull
+    public VaultPKICertificateBundle getCertificateBundle() {
+        return getOrIssue().bundle;
     }
 
     // ---- StandardCertificateCredentials implementation --------------------------
@@ -253,13 +286,13 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
     @NonNull
     @Override
     public KeyStore getKeyStore() {
-        IssuedCertificate issued = getOrIssue();
+        VaultPKICertificateBundle bundle = getCertificateBundle();
         try {
             return buildKeyStore(
-                issued.certificatePem,
-                issued.privateKeyPem.getPlainText(),
-                issued.caChainPem,
-                issued.keystorePassword.getPlainText().toCharArray());
+                bundle.getCertificatePem(),
+                bundle.getPrivateKeyPem().getPlainText(),
+                bundle.getCaChainPem(),
+                getPassword().getPlainText().toCharArray());
         } catch (Exception e) {
             LogRecord lr = new LogRecord(Level.WARNING,
                 "Credentials ID {0}: Could not build PKCS12 keystore from Vault PKI certificate");
@@ -274,8 +307,11 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
 
     @NonNull
     @Override
-    public Secret getPassword() {
-        return getOrIssue().keystorePassword;
+    public synchronized Secret getPassword() {
+        if (keystorePassword == null) {
+            keystorePassword = Secret.fromString(UUID.randomUUID().toString());
+        }
+        return keystorePassword;
     }
 
     // ---- internal certificate issuance -----------------------------------------
@@ -283,9 +319,9 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
     /**
      * Returns the cached {@link IssuedCertificate}, issuing a new one if necessary.
      *
-     * <p>The cache is invalidated automatically when the certificate is within 60 seconds of its
-     * {@code notAfter} expiry (read directly from the X.509 certificate), ensuring that a fresh
-     * certificate is always returned before the current one expires.</p>
+     * <p>The cache is invalidated automatically shortly before the certificate's {@code notAfter}
+     * expiry (read directly from the X.509 certificate), see {@link #computeRenewAfter}, so a
+     * fresh certificate is returned before the current one expires.</p>
      */
     private synchronized IssuedCertificate getOrIssue() {
         if (issuedCertificate == null || Instant.now().isAfter(issuedCertificate.renewAfter)) {
@@ -314,7 +350,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
                 "Vault PKI credentials '" + getId() + "': commonName must not be blank");
         }
 
-        String issuePath = mount + "/issue/" + role;
+        String issuePath = buildIssuePath(mount, role);
 
         Map<String, Object> params = new HashMap<>();
         params.put("common_name", commonName);
@@ -343,9 +379,42 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
         LOGGER.info(String.format(
             "Successfully obtained PKI certificate from Vault: path=%s", issuePath));
 
-        Instant renewAfter = parseCertExpiry(certPem).minusSeconds(60);
-        return new IssuedCertificate(certPem, Secret.fromString(keyPem), caPem, caChainPem,
-            Secret.fromString(leaseId), Secret.fromString(UUID.randomUUID().toString()), renewAfter);
+        Instant renewAfter = computeRenewAfter(Instant.now(), parseCertExpiry(certPem));
+        return new IssuedCertificate(
+            new VaultPKICertificateBundle(certPem, Secret.fromString(keyPem), caPem, caChainPem),
+            Secret.fromString(leaseId), renewAfter);
+    }
+
+    /**
+     * Builds the {@code <mount>/issue/<role>} path after validating both parts, so a crafted
+     * mount or role (e.g. containing {@code ..}) cannot redirect the write to another Vault path.
+     */
+    static String buildIssuePath(String mount, String role) {
+        if (mount == null || !MOUNT_PATTERN.matcher(mount).matches()) {
+            throw new VaultPluginException("Invalid PKI mount path '" + mount
+                + "': use letters, digits, '-', '_' and '.', segments separated by '/'");
+        }
+        if (role == null || !ROLE_PATTERN.matcher(role).matches()) {
+            throw new VaultPluginException("Invalid PKI role name '" + role
+                + "': use letters, digits, '-', '_' and '.'");
+        }
+        return mount + "/issue/" + role;
+    }
+
+    /**
+     * Point in time after which the cached certificate is renewed.  Normally
+     * {@link #RENEWAL_MARGIN} before {@code notAfter}; for certificates with a shorter lifetime the
+     * margin is capped at half of the remaining lifetime, so the result always lies between
+     * {@code issuedAt} and {@code notAfter} and a fresh certificate is not renewed immediately.
+     */
+    static Instant computeRenewAfter(Instant issuedAt, Instant notAfter) {
+        Duration lifetime = Duration.between(issuedAt, notAfter);
+        if (lifetime.isNegative() || lifetime.isZero()) {
+            return issuedAt;
+        }
+        Duration halfLifetime = lifetime.dividedBy(2);
+        Duration margin = RENEWAL_MARGIN.compareTo(halfLifetime) < 0 ? RENEWAL_MARGIN : halfLifetime;
+        return notAfter.minus(margin);
     }
 
     /**
@@ -494,9 +563,9 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
      *   <li>{@code -----BEGIN PRIVATE KEY-----} – PKCS#8, works for RSA and EC.</li>
      *   <li>{@code -----BEGIN RSA PRIVATE KEY-----} – PKCS#1 RSA, converted via a minimal
      *       DER wrapper.</li>
-     *   <li>{@code -----BEGIN EC PRIVATE KEY-----} – requires the {@code bouncycastle-api}
-     *       Jenkins plugin; a {@link VaultPluginException} is thrown with a clear message if it
-     *       is absent.</li>
+     *   <li>{@code -----BEGIN EC PRIVATE KEY-----} (SEC1) – <strong>not supported</strong>; a
+     *       {@link VaultPluginException} explains how to configure the PKI role instead (RSA keys,
+     *       or EC keys in PKCS#8 format).</li>
      * </ul>
      */
     static PrivateKey parsePrivateKey(String pem) {
@@ -534,9 +603,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
 
         // ---- EC SEC1 ----------------------------------------------------------
         if (pem.contains("BEGIN EC PRIVATE KEY")) {
-            // EC SEC1 format requires Bouncy Castle to convert to PKCS#8.
-            // Configure the Vault PKI role with key_type=rsa or ensure Vault returns PKCS#8
-            // by setting the managed_key_name or upgrading to Vault 1.10+.
+            // EC SEC1 would need an ASN.1 conversion to PKCS#8, which is not implemented.
             throw new VaultPluginException(
                 "EC private key in SEC1 format (BEGIN EC PRIVATE KEY) is not directly supported. "
                     + "Configure the Vault PKI role to use RSA keys, or set Vault to return "
@@ -616,33 +683,19 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
      * All fields are consistent (they originate from a single Vault API call).
      */
     static final class IssuedCertificate {
-        final String certificatePem;
-        final Secret privateKeyPem;
-        /** The direct issuer certificate ({@code issuing_ca} field from Vault). */
-        final String issuingCaPem;
-        /**
-         * Full CA chain ({@code ca_chain} field from Vault), or {@code issuingCaPem} when Vault
-         * is a root CA.  May contain multiple concatenated PEM blocks (intermediate + root).
-         */
-        final String caChainPem;
-        /** Vault lease ID – can be used for early revocation. */
+        /** Certificate, private key and CA certificates of this issuance. */
+        final VaultPKICertificateBundle bundle;
+        /** Vault lease ID (only set when the PKI role uses {@code generate_lease=true}). */
         final Secret leaseId;
-        /** Internal PKCS12 keystore password (not exposed to users). */
-        final Secret keystorePassword;
         /**
-         * Time after which the cache should be considered stale (certificate notAfter minus 60s).
+         * Time after which the cache should be considered stale, see {@link #computeRenewAfter}.
          * {@link #getOrIssue()} re-issues when {@code Instant.now()} is past this point.
          */
         final Instant renewAfter;
 
-        IssuedCertificate(String certificatePem, Secret privateKeyPem, String issuingCaPem,
-            String caChainPem, Secret leaseId, Secret keystorePassword, Instant renewAfter) {
-            this.certificatePem = certificatePem;
-            this.privateKeyPem = privateKeyPem;
-            this.issuingCaPem = issuingCaPem;
-            this.caChainPem = caChainPem;
+        IssuedCertificate(VaultPKICertificateBundle bundle, Secret leaseId, Instant renewAfter) {
+            this.bundle = bundle;
             this.leaseId = leaseId;
-            this.keystorePassword = keystorePassword;
             this.renewAfter = renewAfter;
         }
     }
@@ -687,8 +740,9 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials implements 
             }
 
             try {
-                String mount = defaultIfBlank(pkiMount, DEFAULT_PKI_MOUNT);
-                String issuePath = mount + "/issue/" + pkiRole;
+                String issuePath = buildIssuePath(
+                    defaultIfBlank(Util.fixEmptyAndTrim(pkiMount), DEFAULT_PKI_MOUNT),
+                    Util.fixEmptyAndTrim(pkiRole));
 
                 Map<String, Object> params = new HashMap<>();
                 params.put("common_name", commonName);
