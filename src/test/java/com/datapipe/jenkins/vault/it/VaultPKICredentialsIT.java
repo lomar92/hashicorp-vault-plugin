@@ -10,15 +10,19 @@ import com.cloudbees.plugins.credentials.domains.DomainCredentials;
 import com.datapipe.jenkins.vault.credentials.common.VaultPKICertificateBundle;
 import com.datapipe.jenkins.vault.credentials.common.VaultPKICredentials;
 import com.datapipe.jenkins.vault.credentials.common.VaultPKICredentialsImpl;
+import hudson.FilePath;
 import hudson.Functions;
 import hudson.model.Result;
 import hudson.model.Run;
 import hudson.security.ACL;
+import hudson.slaves.WorkspaceList;
 import hudson.util.Secret;
 import java.io.InputStream;
 import java.net.URL;
 import java.security.KeyStore;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import jenkins.model.Jenkins;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
@@ -152,6 +156,53 @@ public class VaultPKICredentialsIT {
                     .readToString().trim();
                 assertEquals("private key file must be owner read-only", "-r--------", keyMode);
             }
+        });
+    }
+
+    // ---- Failure cleanup -------------------------------------------------------
+
+    @Test
+    public void shouldDeleteAlreadyWrittenPemFilesWhenBindingFails() {
+        final String credentialsId = "vault-pki-failing-bind";
+        story.then(r -> {
+            // Certificate and private key are written first, then writing the CA file fails
+            VaultPKICertificateBundle bundle = mock(VaultPKICertificateBundle.class);
+            when(bundle.getCertificatePem()).thenReturn(
+                "-----BEGIN CERTIFICATE-----\nZmFrZWNlcnQ=\n-----END CERTIFICATE-----");
+            when(bundle.getPrivateKeyPem()).thenReturn(Secret.fromString(
+                "-----BEGIN PRIVATE KEY-----\nZmFrZWtleQ==\n-----END PRIVATE KEY-----"));
+            when(bundle.getCaChainPem()).thenThrow(
+                new IllegalStateException("simulated failure while writing the CA file"));
+
+            VaultPKICredentials cred = mock(VaultPKICredentialsImpl.class);
+            when(cred.forRun(any(Run.class))).thenReturn(cred);
+            when(cred.getId()).thenReturn(credentialsId);
+            when(cred.getCertificateBundle()).thenReturn(bundle);
+
+            CredentialsProvider.lookupStores(r.jenkins).iterator().next()
+                .addCredentials(Domain.global(), cred);
+
+            WorkflowJob job = r.jenkins.createProject(WorkflowJob.class, "pki-failing-bind-test");
+            job.setDefinition(new CpsFlowDefinition(""
+                + "node {\n"
+                + "  withCredentials([vaultPKI(credentialsId: '" + credentialsId + "')]) {\n"
+                + "    echo 'should not reach here'\n"
+                + "  }\n"
+                + "}", true));
+
+            WorkflowRun b = job.scheduleBuild2(0).waitForStart();
+            r.assertBuildStatus(Result.FAILURE, r.waitForCompletion(b));
+            r.assertLogContains("simulated failure while writing the CA file", b);
+            r.assertLogNotContains("should not reach here", b);
+
+            FilePath secretFiles = WorkspaceList.tempDir(r.jenkins.getWorkspaceFor(job))
+                .child("secretFiles");
+            List<FilePath> leftovers = secretFiles.exists()
+                ? Arrays.asList(secretFiles.list("**/*")) : Collections.emptyList();
+            assertTrue("no PEM file may survive a failed binding, found " + leftovers,
+                leftovers.isEmpty());
+            assertTrue("the temporary directory itself must be removed as well",
+                !secretFiles.exists() || secretFiles.listDirectories().isEmpty());
         });
     }
 

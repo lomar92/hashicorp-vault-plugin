@@ -119,28 +119,56 @@ public class VaultPKICredentialsBinding extends MultiBinding<VaultPKICredentials
         listener.getLogger().println("[VaultPKI] Writing PKI certificate PEM files to workspace");
 
         UnbindableDir tmpDir = UnbindableDir.create(workspace);
+        try {
+            Map<String, String> envMap = writePemFiles(tmpDir.getDirPath(), bundle, launcher.isUnix());
+            return new MultiEnvironment(envMap, tmpDir.getUnbinder());
+        } catch (IOException | InterruptedException | RuntimeException e) {
+            // Without a returned unbinder nobody would delete the files written so far,
+            // in particular the private key, so remove the whole directory right away.
+            deleteAfterFailure(tmpDir.getDirPath(), e, listener);
+            throw e;
+        }
+    }
 
+    private Map<String, String> writePemFiles(FilePath dir, VaultPKICertificateBundle bundle,
+        boolean unix) throws IOException, InterruptedException {
         Map<String, String> envMap = new HashMap<>();
 
         if (isNotBlank(certPemVariable)) {
-            FilePath certFile = tmpDir.getDirPath().child("vault-pki-cert.pem");
+            FilePath certFile = dir.child("vault-pki-cert.pem");
             certFile.write(bundle.getCertificatePem(), "UTF-8");
             envMap.put(certPemVariable, certFile.getRemote());
         }
 
         if (isNotBlank(privateKeyPemVariable)) {
-            FilePath keyFile = tmpDir.getDirPath().child("vault-pki-key.pem");
-            writePrivateKey(keyFile, bundle.getPrivateKeyPem().getPlainText(), launcher.isUnix());
+            FilePath keyFile = dir.child("vault-pki-key.pem");
+            writePrivateKey(keyFile, bundle.getPrivateKeyPem().getPlainText(), unix);
             envMap.put(privateKeyPemVariable, keyFile.getRemote());
         }
 
         if (isNotBlank(caPemVariable)) {
-            FilePath caFile = tmpDir.getDirPath().child("vault-pki-ca.pem");
+            FilePath caFile = dir.child("vault-pki-ca.pem");
             caFile.write(bundle.getCaChainPem(), "UTF-8");
             envMap.put(caPemVariable, caFile.getRemote());
         }
+        return envMap;
+    }
 
-        return new MultiEnvironment(envMap, tmpDir.getUnbinder());
+    /**
+     * Deletes the temporary directory after {@code bind} failed.  The original failure stays the
+     * primary exception; a cleanup failure is attached to it and reported in the build log.
+     */
+    private static void deleteAfterFailure(FilePath dir, Exception failure, TaskListener listener) {
+        try {
+            dir.deleteRecursive();
+        } catch (IOException | InterruptedException | RuntimeException cleanupFailure) {
+            failure.addSuppressed(cleanupFailure);
+            listener.error("[VaultPKI] Could not delete temporary PEM files in " + dir.getRemote()
+                + " after a failed binding: " + cleanupFailure);
+            if (cleanupFailure instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     /**
