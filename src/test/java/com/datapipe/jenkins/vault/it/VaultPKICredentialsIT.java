@@ -17,8 +17,10 @@ import hudson.model.Run;
 import hudson.security.ACL;
 import hudson.slaves.WorkspaceList;
 import hudson.util.Secret;
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.util.Arrays;
 import java.util.Collections;
@@ -43,6 +45,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -106,12 +109,6 @@ public class VaultPKICredentialsIT {
     @Test
     public void shouldExposeIndividualPemFilesViaPkiBinding() {
         final String credentialsId = "vault-pki-pem-test";
-        final String fakeCertPem =
-            "-----BEGIN CERTIFICATE-----\nZmFrZWNlcnQ=\n-----END CERTIFICATE-----";
-        final String fakeKeyPem =
-            "-----BEGIN PRIVATE KEY-----\nZmFrZWtleQ==\n-----END PRIVATE KEY-----";
-        final String fakeCaPem =
-            "-----BEGIN CERTIFICATE-----\nZmFrZWNh\n-----END CERTIFICATE-----";
 
         story.then(r -> {
             KeyStore ks = loadTestKeyStore();
@@ -120,8 +117,7 @@ public class VaultPKICredentialsIT {
             when(cred.forRun(any(Run.class))).thenReturn(cred);
             when(cred.getId()).thenReturn(credentialsId);
             // Only the bundle is stubbed: the binding must take all PEM material from one snapshot
-            when(cred.getCertificateBundle()).thenReturn(new VaultPKICertificateBundle(
-                fakeCertPem, Secret.fromString(fakeKeyPem), fakeCaPem, fakeCaPem));
+            when(cred.getCertificateBundle()).thenReturn(intermediateCaBundle());
             when(cred.getKeyStore()).thenReturn(ks);
             when(cred.getPassword()).thenReturn(Secret.fromString(KS_PASSWORD));
 
@@ -149,8 +145,9 @@ public class VaultPKICredentialsIT {
 
             String certOut = r.jenkins.getWorkspaceFor(job).child("cert_out.txt")
                 .readToString().trim();
-            assertTrue("cert_out.txt should contain the certificate PEM",
-                certOut.contains("BEGIN CERTIFICATE"));
+            assertEquals("certificate file must hold the leaf followed by the intermediate",
+                pkiFixture("leaf.pem").trim() + "\n" + pkiFixture("intermediate.pem").trim(),
+                certOut.replace("\r\n", "\n"));
             if (!Functions.isWindows()) {
                 String keyMode = r.jenkins.getWorkspaceFor(job).child("key_mode.txt")
                     .readToString().trim();
@@ -167,7 +164,7 @@ public class VaultPKICredentialsIT {
         story.then(r -> {
             // Certificate and private key are written first, then writing the CA file fails
             VaultPKICertificateBundle bundle = mock(VaultPKICertificateBundle.class);
-            when(bundle.getCertificatePem()).thenReturn(
+            when(bundle.getCertificateChainPem()).thenReturn(
                 "-----BEGIN CERTIFICATE-----\nZmFrZWNlcnQ=\n-----END CERTIFICATE-----");
             when(bundle.getPrivateKeyPem()).thenReturn(Secret.fromString(
                 "-----BEGIN PRIVATE KEY-----\nZmFrZWtleQ==\n-----END PRIVATE KEY-----"));
@@ -211,8 +208,6 @@ public class VaultPKICredentialsIT {
     @Test
     public void shouldUseDefaultVariableNamesWhenNotSpecified() {
         final String credentialsId = "vault-pki-defaults-test";
-        final String fakeCertPem =
-            "-----BEGIN CERTIFICATE-----\nZmFrZWNlcnQ=\n-----END CERTIFICATE-----";
 
         story.then(r -> {
             KeyStore ks = loadTestKeyStore();
@@ -220,10 +215,7 @@ public class VaultPKICredentialsIT {
             VaultPKICredentials cred = mock(VaultPKICredentialsImpl.class);
             when(cred.forRun(any(Run.class))).thenReturn(cred);
             when(cred.getId()).thenReturn(credentialsId);
-            when(cred.getCertificateBundle()).thenReturn(new VaultPKICertificateBundle(fakeCertPem,
-                Secret.fromString("-----BEGIN PRIVATE KEY-----\nZg==\n-----END PRIVATE KEY-----"),
-                "-----BEGIN CERTIFICATE-----\nZg==\n-----END CERTIFICATE-----",
-                "-----BEGIN CERTIFICATE-----\nZg==\n-----END CERTIFICATE-----"));
+            when(cred.getCertificateBundle()).thenReturn(intermediateCaBundle());
             when(cred.getKeyStore()).thenReturn(ks);
             when(cred.getPassword()).thenReturn(Secret.fromString(KS_PASSWORD));
 
@@ -358,6 +350,21 @@ public class VaultPKICredentialsIT {
     }
 
     // ---- helpers ---------------------------------------------------------------
+
+    /** Bundle of a real leaf certificate issued by an intermediate CA (chain: intermediate, root). */
+    private static VaultPKICertificateBundle intermediateCaBundle() throws IOException {
+        return new VaultPKICertificateBundle(pkiFixture("leaf.pem"),
+            Secret.fromString(pkiFixture("leaf-key-pkcs8.pem")), pkiFixture("intermediate.pem"),
+            pkiFixture("ca-chain.pem"));
+    }
+
+    private static String pkiFixture(String name) throws IOException {
+        try (InputStream in = VaultPKICredentialsIT.class.getClassLoader().getResourceAsStream(
+            "com/datapipe/jenkins/vault/credentials/common/pki/" + name)) {
+            assertNotNull("missing test fixture " + name, in);
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        }
+    }
 
     private KeyStore loadTestKeyStore() {
         try {

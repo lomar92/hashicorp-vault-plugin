@@ -18,7 +18,10 @@ import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collection;
+import java.util.List;
 import javax.security.auth.x500.X500Principal;
 import org.junit.Test;
 
@@ -144,6 +147,45 @@ public class VaultPKICredentialsImplTest {
             fixture("leaf-key-pkcs1.pem"), fixture("intermediate.pem"), "changeit".toCharArray());
 
         assertEquals(2, ks.getCertificateChain("vault-pki").length);
+    }
+
+    // ---- VaultPKICertificateBundle#getCertificateChainPem ------------------------
+
+    @Test
+    public void certificateChainPem_intermediateSetup_containsLeafAndIntermediateButNotRoot()
+        throws Exception {
+        VaultPKICertificateBundle bundle = new VaultPKICertificateBundle(fixture("leaf.pem"),
+            Secret.fromString(fixture("leaf-key-pkcs8.pem")), fixture("intermediate.pem"),
+            fixture("ca-chain.pem"));
+
+        List<X509Certificate> chain = parseCertificates(bundle.getCertificateChainPem());
+
+        assertEquals("leaf followed by the intermediate", 2, chain.size());
+        assertEquals(subject("leaf.pem"), chain.get(0).getSubjectX500Principal());
+        assertEquals(subject("intermediate.pem"), chain.get(1).getSubjectX500Principal());
+        chain.get(0).verify(chain.get(1).getPublicKey());
+    }
+
+    @Test
+    public void certificateChainPem_rootOnlySetup_containsOnlyLeaf() throws Exception {
+        // Root CA setup: the issuing CA is the self-signed root, which a client never sends
+        VaultPKICertificateBundle bundle = new VaultPKICertificateBundle(fixture("intermediate.pem"),
+            Secret.fromString("unused"), fixture("root.pem"), fixture("root.pem"));
+
+        List<X509Certificate> chain = parseCertificates(bundle.getCertificateChainPem());
+
+        assertEquals(1, chain.size());
+        assertEquals(subject("intermediate.pem"), chain.get(0).getSubjectX500Principal());
+    }
+
+    @Test
+    public void certificateChainPem_unparsableCaChain_throwsDescriptiveException() throws Exception {
+        VaultPKICertificateBundle bundle = new VaultPKICertificateBundle(fixture("leaf.pem"),
+            Secret.fromString("unused"), "garbage", "-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----");
+
+        VaultPluginException ex = assertThrows(VaultPluginException.class,
+            bundle::getCertificateChainPem);
+        assertTrue(ex.getMessage(), ex.getMessage().contains("CA chain"));
     }
 
     // ---- computeRenewAfter -------------------------------------------------------
@@ -308,5 +350,11 @@ public class VaultPKICredentialsImplTest {
         return ((X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(
             new ByteArrayInputStream(fixture(name).getBytes(StandardCharsets.UTF_8))))
             .getSubjectX500Principal();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<X509Certificate> parseCertificates(String pem) throws Exception {
+        return new ArrayList<>((Collection<X509Certificate>) CertificateFactory.getInstance("X.509")
+            .generateCertificates(new ByteArrayInputStream(pem.getBytes(StandardCharsets.UTF_8))));
     }
 }

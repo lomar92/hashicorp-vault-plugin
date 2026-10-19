@@ -136,7 +136,7 @@ public class VaultPKICredentialsBinding extends MultiBinding<VaultPKICredentials
 
         if (isNotBlank(certPemVariable)) {
             FilePath certFile = dir.child("vault-pki-cert.pem");
-            certFile.write(bundle.getCertificatePem(), "UTF-8");
+            certFile.write(bundle.getCertificateChainPem(), "UTF-8");
             envMap.put(certPemVariable, certFile.getRemote());
         }
 
