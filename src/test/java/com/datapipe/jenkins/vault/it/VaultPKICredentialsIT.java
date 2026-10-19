@@ -38,8 +38,6 @@ import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockAuthorizationStrategy;
 import org.jvnet.hudson.test.RestartableJenkinsRule;
 
-import static com.datapipe.jenkins.vault.it.VaultConfigurationIT.getShellString;
-import static com.datapipe.jenkins.vault.it.VaultConfigurationIT.getVariable;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
@@ -91,7 +89,7 @@ public class VaultPKICredentialsIT {
                 + "node {\n"
                 + "  withCredentials([certificate(credentialsId: '" + credentialsId + "',"
                 + "    keystoreVariable: 'KS', passwordVariable: 'KS_PASS')]) {\n"
-                + "    " + getShellString() + " 'echo " + getVariable("KS_PASS") + " > pw.txt'\n"
+                + "    writeFile file: 'pw.txt', text: env.KS_PASS\n"
                 + "  }\n"
                 + "}", true));
 
@@ -131,10 +129,10 @@ public class VaultPKICredentialsIT {
                 + "    certPemVariable: 'CERT_FILE',"
                 + "    privateKeyPemVariable: 'KEY_FILE',"
                 + "    caPemVariable: 'CA_FILE')]) {\n"
-                + "    " + getShellString() + " 'test -f \"" + getVariable("CERT_FILE") + "\"'\n"
-                + "    " + getShellString() + " 'test -f \"" + getVariable("KEY_FILE") + "\"'\n"
-                + "    " + getShellString() + " 'test -f \"" + getVariable("CA_FILE") + "\"'\n"
-                + "    " + getShellString() + " 'cat \"" + getVariable("CERT_FILE") + "\" > cert_out.txt'\n"
+                + assertFileExists("CERT_FILE")
+                + assertFileExists("KEY_FILE")
+                + assertFileExists("CA_FILE")
+                + "    writeFile file: 'cert_out.txt', text: readFile(env.CERT_FILE)\n"
                 + (Functions.isWindows() ? ""
                     : "    sh 'ls -l \"$KEY_FILE\" | cut -c1-10 > key_mode.txt'\n")
                 + "  }\n"
@@ -227,9 +225,9 @@ public class VaultPKICredentialsIT {
             job.setDefinition(new CpsFlowDefinition(""
                 + "node {\n"
                 + "  withCredentials([vaultPKI(credentialsId: '" + credentialsId + "')]) {\n"
-                + "    " + getShellString() + " 'test -f \"" + getVariable("VAULT_PKI_CERT") + "\"'\n"
-                + "    " + getShellString() + " 'test -f \"" + getVariable("VAULT_PKI_KEY") + "\"'\n"
-                + "    " + getShellString() + " 'test -f \"" + getVariable("VAULT_PKI_CA") + "\"'\n"
+                + assertFileExists("VAULT_PKI_CERT")
+                + assertFileExists("VAULT_PKI_KEY")
+                + assertFileExists("VAULT_PKI_CA")
                 + "  }\n"
                 + "}", true));
 
@@ -350,6 +348,15 @@ public class VaultPKICredentialsIT {
     }
 
     // ---- helpers ---------------------------------------------------------------
+
+    /**
+     * Pipeline snippet failing the build unless the environment variable points to an existing
+     * file.  Uses Pipeline steps instead of shell commands so it works on Windows agents too.
+     */
+    private static String assertFileExists(String variable) {
+        return "    if (!fileExists(env." + variable + ")) { error '" + variable
+            + " does not point to an existing file' }\n";
+    }
 
     /** Bundle of a real leaf certificate issued by an intermediate CA (chain: intermediate, root). */
     private static VaultPKICertificateBundle intermediateCaBundle() throws IOException {
