@@ -4,6 +4,10 @@ import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.datapipe.jenkins.vault.exception.VaultPluginException;
 import hudson.util.Secret;
 import io.github.jopenlibs.vault.api.Logical;
+import io.github.jopenlibs.vault.json.Json;
+import io.github.jopenlibs.vault.json.JsonArray;
+import io.github.jopenlibs.vault.json.JsonObject;
+import io.github.jopenlibs.vault.json.JsonValue;
 import io.github.jopenlibs.vault.response.LogicalResponse;
 import io.github.jopenlibs.vault.rest.RestResponse;
 import java.io.ByteArrayInputStream;
@@ -192,6 +196,100 @@ public class VaultPKICredentialsImplTest {
             fixture("leaf-key-pkcs1.pem"), fixture("intermediate.pem"), "changeit".toCharArray());
 
         assertEquals(2, ks.getCertificateChain("vault-pki").length);
+    }
+
+    // ---- Vault issue response: ca_chain extraction ------------------------------
+
+    @Test
+    public void fromResponse_intermediateCaChainArray_buildsCompleteBundle() throws Exception {
+        LogicalResponse response = issueResponse(new JsonArray()
+            .add(fixture("intermediate.pem")).add(fixture("root.pem")));
+        Instant issuedAt = Instant.now();
+
+        VaultPKICredentialsImpl.IssuedCertificate issued =
+            VaultPKICredentialsImpl.fromResponse(response, "pki-int/issue/jenkins", issuedAt);
+
+        VaultPKICertificateBundle bundle = issued.bundle;
+        assertEquals(fixture("leaf.pem"), bundle.getCertificatePem());
+        assertEquals(fixture("leaf-key-pkcs8.pem"), bundle.getPrivateKeyPem().getPlainText());
+        assertEquals(fixture("intermediate.pem"), bundle.getIssuingCaPem());
+        assertEquals("ca_chain must contain intermediate and root in Vault's order",
+            fixture("intermediate.pem").trim() + "\n" + fixture("root.pem").trim(),
+            bundle.getCaChainPem());
+        assertEquals(2, parseCertificates(bundle.getCaChainPem()).size());
+        assertEquals("client chain: leaf + intermediate",
+            2, parseCertificates(bundle.getCertificateChainPem()).size());
+        assertEquals("lease-123", issued.leaseId.getPlainText());
+        assertTrue(issued.renewAfter.isAfter(issuedAt));
+    }
+
+    @Test
+    public void extractCaChain_absentField_fallsBackToIssuingCa() throws Exception {
+        assertCaChainFallsBack(issueResponse(null));
+    }
+
+    @Test
+    public void extractCaChain_nullField_fallsBackToIssuingCa() throws Exception {
+        assertCaChainFallsBack(issueResponse(Json.NULL));
+    }
+
+    @Test
+    public void extractCaChain_emptyArray_fallsBackToIssuingCa() throws Exception {
+        assertCaChainFallsBack(issueResponse(new JsonArray()));
+    }
+
+    @Test
+    public void extractCaChain_notAnArray_fallsBackToIssuingCa() throws Exception {
+        assertCaChainFallsBack(issueResponse(Json.value(fixture("root.pem"))));
+    }
+
+    @Test
+    public void extractCaChain_arrayWithNonStringEntries_fallsBackToIssuingCa() throws Exception {
+        assertCaChainFallsBack(issueResponse(new JsonArray().add(42).add(true)));
+    }
+
+    @Test
+    public void extractCaChain_arrayWithOnlyBlankEntries_fallsBackToIssuingCa() throws Exception {
+        assertCaChainFallsBack(issueResponse(new JsonArray().add("").add("  ")));
+    }
+
+    @Test
+    public void fromResponse_missingPrivateKey_throwsDescriptiveException() throws Exception {
+        JsonObject data = Json.object()
+            .add("certificate", fixture("leaf.pem"))
+            .add("issuing_ca", fixture("intermediate.pem"));
+        LogicalResponse response = response(200, Json.object().add("data", data).toString());
+
+        VaultPluginException ex = assertThrows(VaultPluginException.class,
+            () -> VaultPKICredentialsImpl.fromResponse(response, "pki-int/issue/jenkins",
+                Instant.now()));
+        assertTrue(ex.getMessage(), ex.getMessage().contains("private_key"));
+    }
+
+    private static void assertCaChainFallsBack(LogicalResponse response) throws Exception {
+        assertEquals(fixture("intermediate.pem"),
+            VaultPKICredentialsImpl.extractCaChain(response, fixture("intermediate.pem")));
+        assertEquals(fixture("intermediate.pem"), VaultPKICredentialsImpl.fromResponse(
+            response, "pki-int/issue/jenkins", Instant.now()).bundle.getCaChainPem());
+    }
+
+    /** A Vault {@code /issue} response as returned by Vault; {@code caChain == null} omits it. */
+    private static LogicalResponse issueResponse(JsonValue caChain) throws Exception {
+        JsonObject data = Json.object()
+            .add("certificate", fixture("leaf.pem"))
+            .add("private_key", fixture("leaf-key-pkcs8.pem"))
+            .add("private_key_type", "rsa")
+            .add("issuing_ca", fixture("intermediate.pem"))
+            .add("serial_number", "39:dd:2e");
+        if (caChain != null) {
+            data.add("ca_chain", caChain);
+        }
+        JsonObject body = Json.object()
+            .add("lease_id", "lease-123")
+            .add("renewable", false)
+            .add("lease_duration", 0)
+            .add("data", data);
+        return response(200, body.toString());
     }
 
     // ---- VaultPKICertificateBundle#getCertificateChainPem ------------------------

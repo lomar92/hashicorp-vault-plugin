@@ -422,6 +422,20 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
             issuePath, commonName, getTtl()));
 
         LogicalResponse response = writeVaultSecret(issuePath, params, namespace, context);
+        IssuedCertificate issued = fromResponse(response, issuePath, Instant.now(clock()));
+
+        LOGGER.info(String.format(
+            "Successfully obtained PKI certificate from Vault: path=%s", issuePath));
+        return issued;
+    }
+
+    /**
+     * Turns the response of {@code <mount>/issue/<role>} into the cached issuance: checks the HTTP
+     * status, reads certificate, private key, issuing CA and {@code ca_chain}, and computes when
+     * the certificate has to be renewed.
+     */
+    static IssuedCertificate fromResponse(LogicalResponse response, String issuePath,
+        Instant issuedAt) {
         checkResponseStatus(response, issuePath);
         Map<String, String> data = response.getData();
 
@@ -429,15 +443,11 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
         String keyPem = requireData(data, "private_key", issuePath);
         String caPem = requireData(data, "issuing_ca", issuePath);
         String caChainPem = extractCaChain(response, caPem);
-        String leaseId = response.getLeaseId();
 
-        LOGGER.info(String.format(
-            "Successfully obtained PKI certificate from Vault: path=%s", issuePath));
-
-        Instant renewAfter = computeRenewAfter(Instant.now(clock()), parseCertExpiry(certPem));
+        Instant renewAfter = computeRenewAfter(issuedAt, parseCertExpiry(certPem));
         return new IssuedCertificate(
             new VaultPKICertificateBundle(certPem, Secret.fromString(keyPem), caPem, caChainPem),
-            Secret.fromString(leaseId), renewAfter);
+            Secret.fromString(response.getLeaseId()), renewAfter);
     }
 
     /**
@@ -519,7 +529,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
      * <p>Falls back to {@code issuingCaPem} if {@code ca_chain} is absent or empty (root CA
      * setup or older Vault versions).</p>
      */
-    private static String extractCaChain(LogicalResponse response, String issuingCaPem) {
+    static String extractCaChain(LogicalResponse response, String issuingCaPem) {
         try {
             JsonObject dataObject = response.getDataObject();
             if (dataObject == null) {
