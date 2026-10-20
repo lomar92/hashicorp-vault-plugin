@@ -415,16 +415,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
         }
 
         String issuePath = buildIssuePath(mount, role);
-
-        Map<String, Object> params = new HashMap<>();
-        params.put("common_name", commonName);
-        params.put("ttl", defaultIfBlank(ttl, DEFAULT_TTL));
-        if (isNotBlank(altNames)) {
-            params.put("alt_names", altNames);
-        }
-        if (isNotBlank(ipSans)) {
-            params.put("ip_sans", ipSans);
-        }
+        Map<String, Object> params = buildIssueParams(commonName, ttl, altNames, ipSans);
 
         LOGGER.info(String.format(
             "Requesting PKI certificate from Vault: path=%s common_name=%s ttl=%s",
@@ -447,6 +438,29 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
         return new IssuedCertificate(
             new VaultPKICertificateBundle(certPem, Secret.fromString(keyPem), caPem, caChainPem),
             Secret.fromString(leaseId), renewAfter);
+    }
+
+    /**
+     * Request body for {@code <mount>/issue/<role>}.
+     *
+     * <p>{@code private_key_format=pkcs8} makes Vault return the private key as PKCS#8
+     * ({@code BEGIN PRIVATE KEY}) for every key type.  Without it Vault returns EC keys in SEC1
+     * format ({@code BEGIN EC PRIVATE KEY}), which {@link #parsePrivateKey} cannot read, so EC roles
+     * would fail in the {@code certificate()} binding.</p>
+     */
+    static Map<String, Object> buildIssueParams(String commonName, String ttl, String altNames,
+        String ipSans) {
+        Map<String, Object> params = new HashMap<>();
+        params.put("common_name", commonName);
+        params.put("ttl", defaultIfBlank(ttl, DEFAULT_TTL));
+        params.put("private_key_format", "pkcs8");
+        if (isNotBlank(altNames)) {
+            params.put("alt_names", altNames);
+        }
+        if (isNotBlank(ipSans)) {
+            params.put("ip_sans", ipSans);
+        }
+        return params;
     }
 
     /**
@@ -625,9 +639,10 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
      *   <li>{@code -----BEGIN PRIVATE KEY-----} – PKCS#8, works for RSA and EC.</li>
      *   <li>{@code -----BEGIN RSA PRIVATE KEY-----} – PKCS#1 RSA, converted via a minimal
      *       DER wrapper.</li>
-     *   <li>{@code -----BEGIN EC PRIVATE KEY-----} (SEC1) – <strong>not supported</strong>; a
-     *       {@link VaultPluginException} explains how to configure the PKI role instead (RSA keys,
-     *       or EC keys in PKCS#8 format).</li>
+     *   <li>{@code -----BEGIN EC PRIVATE KEY-----} (SEC1) – <strong>not supported</strong>.  It is
+     *       not expected because issuance requests {@code private_key_format=pkcs8} (see
+     *       {@link #buildIssueParams}); a {@link VaultPluginException} reports it if a Vault
+     *       version ignores that parameter.</li>
      * </ul>
      */
     static PrivateKey parsePrivateKey(String pem) {
@@ -665,12 +680,13 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
 
         // ---- EC SEC1 ----------------------------------------------------------
         if (pem.contains("BEGIN EC PRIVATE KEY")) {
-            // EC SEC1 would need an ASN.1 conversion to PKCS#8, which is not implemented.
+            // Only reached if Vault ignored private_key_format=pkcs8; SEC1 would need an ASN.1
+            // conversion to PKCS#8, which is not implemented.
             throw new VaultPluginException(
-                "EC private key in SEC1 format (BEGIN EC PRIVATE KEY) is not directly supported. "
-                    + "Configure the Vault PKI role to use RSA keys, or set Vault to return "
-                    + "PKCS#8 format (BEGIN PRIVATE KEY). "
-                    + "See https://developer.hashicorp.com/vault/docs/secrets/pki");
+                "Vault returned an EC private key in SEC1 format (BEGIN EC PRIVATE KEY) although "
+                    + "PKCS#8 was requested (private_key_format=pkcs8). Use a Vault version that "
+                    + "supports private_key_format, or configure the PKI role to use RSA keys. "
+                    + "See https://developer.hashicorp.com/vault/api-docs/secret/pki#generate-certificate-and-key");
         }
 
         throw new VaultPluginException(
@@ -806,15 +822,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
                     defaultIfBlank(Util.fixEmptyAndTrim(pkiMount), DEFAULT_PKI_MOUNT),
                     Util.fixEmptyAndTrim(pkiRole));
 
-                Map<String, Object> params = new HashMap<>();
-                params.put("common_name", commonName);
-                params.put("ttl", defaultIfBlank(ttl, DEFAULT_TTL));
-                if (isNotBlank(altNames)) {
-                    params.put("alt_names", altNames);
-                }
-                if (isNotBlank(ipSans)) {
-                    params.put("ip_sans", ipSans);
-                }
+                Map<String, Object> params = buildIssueParams(commonName, ttl, altNames, ipSans);
 
                 LogicalResponse response = writeVaultSecret(issuePath, params,
                     Util.fixEmptyAndTrim(namespace), context);

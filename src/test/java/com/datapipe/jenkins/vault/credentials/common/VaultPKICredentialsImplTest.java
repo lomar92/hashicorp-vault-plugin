@@ -77,6 +77,43 @@ public class VaultPKICredentialsImplTest {
     // ---- parsePrivateKey – unsupported formats --------------------------------
 
     @Test
+    public void parsePrivateKey_pkcs8Ec_returnsEcKey() throws Exception {
+        KeyPairGenerator gen = KeyPairGenerator.getInstance("EC");
+        gen.initialize(256);
+        KeyPair kp = gen.generateKeyPair();
+
+        PrivateKey parsed = VaultPKICredentialsImpl.parsePrivateKey(pkcs8Pem(kp.getPrivate()));
+
+        assertEquals("EC", parsed.getAlgorithm());
+        assertArrayEquals(kp.getPrivate().getEncoded(), parsed.getEncoded());
+    }
+
+    // ---- issue request parameters ----------------------------------------------
+
+    @Test
+    public void buildIssueParams_requestsPkcs8PrivateKeys() {
+        Map<String, Object> params = VaultPKICredentialsImpl.buildIssueParams(
+            "jenkins.example.com", "15m", "a.example.com", "10.0.0.1");
+
+        // without it Vault returns EC keys as SEC1, which the keystore parser rejects
+        assertEquals("pkcs8", params.get("private_key_format"));
+        assertEquals("jenkins.example.com", params.get("common_name"));
+        assertEquals("15m", params.get("ttl"));
+        assertEquals("a.example.com", params.get("alt_names"));
+        assertEquals("10.0.0.1", params.get("ip_sans"));
+    }
+
+    @Test
+    public void buildIssueParams_optionalFieldsOmittedAndDefaultTtl() {
+        Map<String, Object> params = VaultPKICredentialsImpl.buildIssueParams(
+            "jenkins.example.com", null, null, " ");
+
+        assertEquals("pkcs8", params.get("private_key_format"));
+        assertEquals(VaultPKICredentialsImpl.DEFAULT_TTL, params.get("ttl"));
+        assertTrue(!params.containsKey("alt_names") && !params.containsKey("ip_sans"));
+    }
+
+    @Test
     public void parsePrivateKey_ecSec1Format_throwsDescriptiveException() {
         String pem = "-----BEGIN EC PRIVATE KEY-----\nZmFrZWtleWRhdGE=\n-----END EC PRIVATE KEY-----";
 
