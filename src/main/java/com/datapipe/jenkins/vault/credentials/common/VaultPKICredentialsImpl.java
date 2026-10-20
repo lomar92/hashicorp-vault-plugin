@@ -1,5 +1,6 @@
 package com.datapipe.jenkins.vault.credentials.common;
 
+import com.cloudbees.plugins.credentials.Credentials;
 import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.cloudbees.plugins.credentials.impl.BaseStandardCredentials;
 import com.datapipe.jenkins.vault.exception.VaultPluginException;
@@ -9,6 +10,7 @@ import hudson.Extension;
 import hudson.Util;
 import hudson.model.Item;
 import hudson.model.ItemGroup;
+import hudson.model.Run;
 import hudson.util.FormValidation;
 import hudson.util.Secret;
 import io.github.jopenlibs.vault.json.Json;
@@ -30,6 +32,7 @@ import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.security.spec.PKCS8EncodedKeySpec;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -98,9 +101,6 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
     /** Default certificate TTL – short-lived to limit blast radius. */
     public static final String DEFAULT_TTL = "1h";
 
-    /** Renew the cached certificate this long before it expires (capped at half its lifetime). */
-    static final Duration RENEWAL_MARGIN = Duration.ofSeconds(60);
-
     /**
      * One Vault path segment: letters, digits, {@code -} and {@code _}, optionally separated by
      * single dots.  This rules out {@code .} and {@code ..} segments (path traversal).
@@ -140,10 +140,19 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
     /** Optional Vault Enterprise namespace (leave blank for OSS/HCP). */
     private String namespace;
 
+    /**
+     * Issue a separate certificate for every build instead of sharing the cached certificate
+     * between builds.  Off by default.
+     */
+    private boolean issuePerBuild;
+
     // ---- transient runtime state ------------------------------------------------
 
     /** Lazily-issued certificate data, cached within a single JVM lifecycle. */
     private transient volatile IssuedCertificate issuedCertificate;
+
+    /** Time source for the cache; only replaced in tests. */
+    private transient Clock clock;
 
     /**
      * Password of the PKCS12 keystore handed out by {@link #getKeyStore()}.  Kept per credential
@@ -234,6 +243,15 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
         this.namespace = Util.fixEmptyAndTrim(namespace);
     }
 
+    public boolean isIssuePerBuild() {
+        return issuePerBuild;
+    }
+
+    @DataBoundSetter
+    public void setIssuePerBuild(boolean issuePerBuild) {
+        this.issuePerBuild = issuePerBuild;
+    }
+
     @Override
     public void setContext(@NonNull ItemGroup context) {
         this.context = context;
@@ -247,6 +265,37 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
     @Override
     public String getDisplayName() {
         return getPkiMount() + "/" + getPkiRole();
+    }
+
+    /**
+     * Called by the Credentials plugin whenever a build looks up this credential (for both the
+     * {@code certificate()} and the {@code vaultPKI()} binding).
+     *
+     * <p>By default all builds share the cached certificate.  With {@link #isIssuePerBuild()}
+     * every lookup gets its own copy with an empty cache, so each build issues its own
+     * certificate with the full TTL and no private key is shared with other builds.  Within one
+     * binding the copy issues once, so certificate, key and keystore stay consistent.</p>
+     */
+    @NonNull
+    @Override
+    public Credentials forRun(@CheckForNull Run<?, ?> run) {
+        return issuePerBuild ? copyWithEmptyCache() : this;
+    }
+
+    VaultPKICredentialsImpl copyWithEmptyCache() {
+        VaultPKICredentialsImpl copy = new VaultPKICredentialsImpl(getScope(), getId(),
+            getDescription());
+        copy.pkiMount = pkiMount;
+        copy.pkiRole = pkiRole;
+        copy.commonName = commonName;
+        copy.ttl = ttl;
+        copy.altNames = altNames;
+        copy.ipSans = ipSans;
+        copy.namespace = namespace;
+        copy.issuePerBuild = issuePerBuild;
+        copy.context = context;
+        copy.clock = clock;
+        return copy;
     }
 
     // ---- VaultPKICredentials implementation -------------------------------------
@@ -319,15 +368,30 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
     /**
      * Returns the cached {@link IssuedCertificate}, issuing a new one if necessary.
      *
-     * <p>The cache is invalidated automatically shortly before the certificate's {@code notAfter}
-     * expiry (read directly from the X.509 certificate), see {@link #computeRenewAfter}, so a
-     * fresh certificate is returned before the current one expires.</p>
+     * <p>The cached certificate is shared by all builds using this credential.  It is renewed
+     * once half of its lifetime has passed (see {@link #computeRenewAfter}), so every build
+     * receives a certificate with at least half of the configured TTL left - e.g. at least 30
+     * minutes for the default TTL of {@code 1h}.</p>
      */
     private synchronized IssuedCertificate getOrIssue() {
-        if (issuedCertificate == null || Instant.now().isAfter(issuedCertificate.renewAfter)) {
+        IssuedCertificate cached = issuedCertificate;
+        if (cached == null || !Instant.now(clock()).isBefore(cached.renewAfter)) {
+            if (cached != null) {
+                LOGGER.info(String.format("Vault PKI credentials '%s': renewing certificate, "
+                    + "half of its lifetime has passed", getId()));
+            }
             issuedCertificate = issueCertificate();
         }
         return issuedCertificate;
+    }
+
+    Clock clock() {
+        return clock != null ? clock : Clock.systemUTC();
+    }
+
+    /** Test hook: replaces the time source used for cache renewal. */
+    void setClock(Clock clock) {
+        this.clock = clock;
     }
 
     /**
@@ -338,7 +402,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
         issuedCertificate = null;
     }
 
-    private IssuedCertificate issueCertificate() {
+    IssuedCertificate issueCertificate() {
         String mount = getPkiMount();
         String role = pkiRole;
         if (StringUtils.isBlank(role)) {
@@ -379,7 +443,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
         LOGGER.info(String.format(
             "Successfully obtained PKI certificate from Vault: path=%s", issuePath));
 
-        Instant renewAfter = computeRenewAfter(Instant.now(), parseCertExpiry(certPem));
+        Instant renewAfter = computeRenewAfter(Instant.now(clock()), parseCertExpiry(certPem));
         return new IssuedCertificate(
             new VaultPKICertificateBundle(certPem, Secret.fromString(keyPem), caPem, caChainPem),
             Secret.fromString(leaseId), renewAfter);
@@ -402,19 +466,17 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
     }
 
     /**
-     * Point in time after which the cached certificate is renewed.  Normally
-     * {@link #RENEWAL_MARGIN} before {@code notAfter}; for certificates with a shorter lifetime the
-     * margin is capped at half of the remaining lifetime, so the result always lies between
-     * {@code issuedAt} and {@code notAfter} and a fresh certificate is not renewed immediately.
+     * Point in time after which the cached certificate is renewed: once half of its lifetime
+     * ({@code issuedAt} to {@code notAfter}) has passed.  A build that picks up the cached
+     * certificate therefore always gets at least half of the lifetime, instead of a certificate
+     * that is about to expire.  An already expired certificate is renewed immediately.
      */
     static Instant computeRenewAfter(Instant issuedAt, Instant notAfter) {
         Duration lifetime = Duration.between(issuedAt, notAfter);
         if (lifetime.isNegative() || lifetime.isZero()) {
             return issuedAt;
         }
-        Duration halfLifetime = lifetime.dividedBy(2);
-        Duration margin = RENEWAL_MARGIN.compareTo(halfLifetime) < 0 ? RENEWAL_MARGIN : halfLifetime;
-        return notAfter.minus(margin);
+        return issuedAt.plus(lifetime.dividedBy(2));
     }
 
     /**
@@ -689,7 +751,7 @@ public class VaultPKICredentialsImpl extends BaseStandardCredentials
         final Secret leaseId;
         /**
          * Time after which the cache should be considered stale, see {@link #computeRenewAfter}.
-         * {@link #getOrIssue()} re-issues when {@code Instant.now()} is past this point.
+         * {@link #getOrIssue()} re-issues once this point is reached.
          */
         final Instant renewAfter;
 

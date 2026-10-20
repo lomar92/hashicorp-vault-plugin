@@ -1,5 +1,6 @@
 package com.datapipe.jenkins.vault.credentials.common;
 
+import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.datapipe.jenkins.vault.exception.VaultPluginException;
 import hudson.util.Secret;
 import io.github.jopenlibs.vault.api.Logical;
@@ -16,12 +17,17 @@ import java.security.Signature;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import javax.security.auth.x500.X500Principal;
 import org.junit.Test;
 
@@ -29,6 +35,8 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -191,11 +199,11 @@ public class VaultPKICredentialsImplTest {
     // ---- computeRenewAfter -------------------------------------------------------
 
     @Test
-    public void computeRenewAfter_regularLifetime_renewsOneMinuteBeforeExpiry() {
+    public void computeRenewAfter_regularLifetime_renewsAfterHalfTheLifetime() {
         Instant issuedAt = Instant.parse("2026-01-01T00:00:00Z");
         Instant notAfter = issuedAt.plus(Duration.ofHours(1));
 
-        assertEquals(notAfter.minusSeconds(60),
+        assertEquals(issuedAt.plus(Duration.ofMinutes(30)),
             VaultPKICredentialsImpl.computeRenewAfter(issuedAt, notAfter));
     }
 
@@ -217,6 +225,177 @@ public class VaultPKICredentialsImplTest {
 
         assertEquals(issuedAt,
             VaultPKICredentialsImpl.computeRenewAfter(issuedAt, issuedAt.minusSeconds(5)));
+    }
+
+    // ---- shared certificate cache ------------------------------------------------
+
+    @Test
+    public void cachedCertificate_laterBuildNeverGetsLessThanHalfTheTtl() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        CountingCredentials cred = new CountingCredentials(Duration.ofHours(1));
+        cred.setClock(clock);
+
+        VaultPKICertificateBundle first = cred.getCertificateBundle();
+        assertEquals(1, cred.issued);
+
+        // a build 29 minutes later still shares the cached certificate (31 minutes left)
+        clock.advance(Duration.ofMinutes(29));
+        assertSame(first, cred.getCertificateBundle());
+        assertEquals(1, cred.issued);
+
+        // a build 58 minutes after issuance must not get the old certificate with 2 minutes left
+        clock.advance(Duration.ofMinutes(29));
+        VaultPKICertificateBundle later = cred.getCertificateBundle();
+        assertNotSame("nearly expired certificate must not be handed out", first, later);
+        assertEquals(2, cred.issued);
+        assertEquals("the later build gets the full TTL",
+            clock.instant().plus(Duration.ofHours(1)), cred.notAfterOf(later));
+    }
+
+    @Test
+    public void cachedCertificate_remainingLifetimeAlwaysAtLeastHalfTheTtl() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        CountingCredentials cred = new CountingCredentials(Duration.ofHours(1));
+        cred.setClock(clock);
+
+        for (int minute = 0; minute <= 180; minute++) {
+            VaultPKICertificateBundle bundle = cred.getCertificateBundle();
+            Duration remaining = Duration.between(clock.instant(), cred.notAfterOf(bundle));
+            assertTrue("only " + remaining + " left at minute " + minute,
+                remaining.compareTo(Duration.ofMinutes(30)) >= 0);
+            clock.advance(Duration.ofMinutes(1));
+        }
+        assertEquals("renewed every 30 minutes over 3 hours", 7, cred.issued);
+    }
+
+    @Test
+    public void forRun_default_sharesTheCachedCertificateBetweenBuilds() {
+        CountingCredentials cred = new CountingCredentials(Duration.ofHours(1));
+
+        VaultPKICredentials build1 = (VaultPKICredentials) cred.forRun(null);
+        VaultPKICredentials build2 = (VaultPKICredentials) cred.forRun(null);
+
+        assertSame(cred, build1);
+        assertSame(build1.getCertificateBundle(), build2.getCertificateBundle());
+        assertEquals(1, cred.issued);
+    }
+
+    @Test
+    public void forRun_issuePerBuild_givesEveryBuildItsOwnCertificate() {
+        CountingCredentials cred = new CountingCredentials(Duration.ofHours(1));
+        cred.setIssuePerBuild(true);
+
+        VaultPKICredentials build1 = (VaultPKICredentials) cred.forRun(null);
+        VaultPKICredentials build2 = (VaultPKICredentials) cred.forRun(null);
+
+        assertNotSame(build1, build2);
+        VaultPKICertificateBundle bundle1 = build1.getCertificateBundle();
+        VaultPKICertificateBundle bundle2 = build2.getCertificateBundle();
+        assertNotSame("builds must not share a certificate", bundle1, bundle2);
+        assertEquals(2, cred.issued);
+        // within one build the material stays consistent (issued once)
+        assertSame(bundle1, build1.getCertificateBundle());
+        assertEquals(2, cred.issued);
+    }
+
+    @Test
+    public void forRun_issuePerBuild_copyKeepsTheConfiguration() {
+        VaultPKICredentialsImpl cred = new VaultPKICredentialsImpl(CredentialsScope.GLOBAL,
+            "pki-id", "pki description");
+        cred.setPkiMount("pki-int");
+        cred.setPkiRole("jenkins");
+        cred.setCommonName("jenkins.example.com");
+        cred.setTtl("15m");
+        cred.setAltNames("a.example.com");
+        cred.setIpSans("10.0.0.1");
+        cred.setNamespace("team-a");
+        cred.setIssuePerBuild(true);
+
+        VaultPKICredentialsImpl copy = (VaultPKICredentialsImpl) cred.forRun(null);
+
+        assertNotSame(cred, copy);
+        assertEquals(cred.getId(), copy.getId());
+        assertEquals(cred.getScope(), copy.getScope());
+        assertEquals(cred.getDescription(), copy.getDescription());
+        assertEquals("pki-int", copy.getPkiMount());
+        assertEquals("jenkins", copy.getPkiRole());
+        assertEquals("jenkins.example.com", copy.getCommonName());
+        assertEquals("15m", copy.getTtl());
+        assertEquals("a.example.com", copy.getAltNames());
+        assertEquals("10.0.0.1", copy.getIpSans());
+        assertEquals("team-a", copy.getNamespace());
+        assertTrue(copy.isIssuePerBuild());
+        // a fresh instance: its own keystore password, not the original's
+        assertNotEquals(cred.getPassword().getPlainText(), copy.getPassword().getPlainText());
+    }
+
+    /** Credentials whose issuance is simulated: every issuance gets a new bundle and lifetime. */
+    private static final class CountingCredentials extends VaultPKICredentialsImpl {
+        private final Duration lifetime;
+        private final Map<VaultPKICertificateBundle, Instant> notAfter = new IdentityHashMap<>();
+        int issued;
+
+        private final CountingCredentials counter;
+
+        CountingCredentials(Duration lifetime) {
+            this(lifetime, null);
+        }
+
+        private CountingCredentials(Duration lifetime, CountingCredentials counter) {
+            super(null, "counting", "simulated issuance");
+            this.lifetime = lifetime;
+            this.counter = counter;
+        }
+
+        @Override
+        VaultPKICredentialsImpl copyWithEmptyCache() {
+            CountingCredentials copy = new CountingCredentials(lifetime, this);
+            copy.setClock(clock());
+            return copy;
+        }
+
+        @Override
+        IssuedCertificate issueCertificate() {
+            CountingCredentials root = counter != null ? counter : this;
+            int n = ++root.issued;
+            Instant now = clock().instant();
+            VaultPKICertificateBundle bundle = new VaultPKICertificateBundle("cert-" + n,
+                Secret.fromString("key-" + n), "ca", "ca");
+            notAfter.put(bundle, now.plus(lifetime));
+            return new IssuedCertificate(bundle, Secret.fromString("lease-" + n),
+                computeRenewAfter(now, now.plus(lifetime)));
+        }
+
+        Instant notAfterOf(VaultPKICertificateBundle bundle) {
+            return notAfter.get(bundle);
+        }
+    }
+
+    private static final class MutableClock extends Clock {
+        private Instant now;
+
+        MutableClock(Instant now) {
+            this.now = now;
+        }
+
+        void advance(Duration d) {
+            now = now.plus(d);
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
     }
 
     // ---- buildIssuePath ------------------------------------------------------------
