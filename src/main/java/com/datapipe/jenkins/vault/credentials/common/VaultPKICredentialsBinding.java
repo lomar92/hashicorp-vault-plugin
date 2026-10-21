@@ -11,6 +11,8 @@ import hudson.model.TaskListener;
 import hudson.remoting.VirtualChannel;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.attribute.AclFileAttributeView;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -191,12 +193,23 @@ public class VaultPKICredentialsBinding extends MultiBinding<VaultPKICredentials
         }
     }
 
-    /** Applies {@link WindowsFilePermissionHelper#fixSshKeyOnWindows} on the agent owning the file. */
-    private static final class RestrictToOwnerOnWindows extends MasterToSlaveFileCallable<Void> {
+    /**
+     * Restricts the file to its owner via {@link WindowsFilePermissionHelper#fixSshKeyOnWindows},
+     * executed on the agent owning the file.  That helper silently does nothing on file systems
+     * without ACL support (e.g. FAT32/exFAT or some network shares), so such file systems are
+     * rejected here: the binding then fails and deletes the (still empty) key file instead of
+     * writing the private key without owner-only protection.
+     */
+    static final class RestrictToOwnerOnWindows extends MasterToSlaveFileCallable<Void> {
         private static final long serialVersionUID = 1L;
 
         @Override
-        public Void invoke(File f, VirtualChannel channel) {
+        public Void invoke(File f, VirtualChannel channel) throws IOException {
+            if (Files.getFileAttributeView(f.toPath(), AclFileAttributeView.class) == null) {
+                throw new IOException("The file system of " + f + " does not support access "
+                    + "control lists, refusing to write the private key without owner-only "
+                    + "permissions");
+            }
             WindowsFilePermissionHelper.fixSshKeyOnWindows(f.toPath());
             return null;
         }
